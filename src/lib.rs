@@ -1,8 +1,21 @@
 use std::collections::{btree_map::Entry, BTreeMap};
 
-fn main() {
-    println!("Hello, world!");
-}
+#[derive(
+    PartialEq,
+    Eq,
+    Hash,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialOrd,
+    Ord,
+    derive_more::Add,
+    derive_more::AddAssign,
+    derive_more::Sub,
+    derive_more::SubAssign,
+)]
+pub struct Price(u64);
 
 #[derive(
     PartialEq,
@@ -19,50 +32,32 @@ fn main() {
     derive_more::Sub,
     derive_more::SubAssign,
 )]
-struct Price(u64);
+pub struct Volume(u64);
 
-#[derive(
-    PartialEq,
-    Eq,
-    Hash,
-    Debug,
-    Clone,
-    Copy,
-    Default,
-    PartialOrd,
-    Ord,
-    derive_more::Add,
-    derive_more::AddAssign,
-    derive_more::Sub,
-    derive_more::SubAssign,
-)]
-struct Volume(u64);
-
-struct OrderBook {
+pub struct OrderBook {
     best_ask: Price,
     best_bid: Price,
     levels: BTreeMap<Price, Volume>,
 }
 
 impl OrderBook {
-    fn new() -> Self {
+    pub fn new() -> Self {
         OrderBook {
             best_ask: Price(u64::MAX),
             best_bid: Price(u64::MIN),
             levels: BTreeMap::new(),
         }
     }
-}
 
-enum Outcome {
-    PlacedExisting,
-    PlacedNew,
-    PlacedNewBest,
-    CrossedSpread,
-}
+    pub fn best_bid(&self) -> Price {
+        self.best_bid
+    }
 
-impl OrderBook {
-    fn add_bid(&mut self, price: Price, volume: Volume) -> Outcome {
+    pub fn best_ask(&self) -> Price {
+        self.best_ask
+    }
+
+    pub fn add_bid(&mut self, price: Price, volume: Volume) -> Outcome {
         if self.best_ask <= price {
             return Outcome::CrossedSpread;
         }
@@ -89,7 +84,7 @@ impl OrderBook {
         }
     }
 
-    fn add_ask(&mut self, price: Price, volume: Volume) -> Outcome {
+    pub fn add_ask(&mut self, price: Price, volume: Volume) -> Outcome {
         if self.best_bid >= price {
             return Outcome::CrossedSpread;
         }
@@ -116,37 +111,57 @@ impl OrderBook {
         }
     }
 
-    fn execute_buy_best_price(&mut self, mut volume: Volume) -> Result<(), Volume> {
-        for (price, vol) in self.levels.range_mut(self.best_ask..) {
-            if *vol < volume {
-                volume -= *vol;
-                *vol = Volume(0);
+    pub fn execute_buy_best_price(&mut self, mut buy_vol: Volume) -> Result<(), Volume> {
+        for (price, level_vol) in self.levels.range_mut(self.best_ask..) {
+            if buy_vol == Volume(0) {
+                // we're done
+                self.best_ask = *price;
+                return Ok(());
+            } else if buy_vol >= *level_vol {
+                // will exhause this level
+                buy_vol -= *level_vol;
+                *level_vol = Volume(0);
             } else {
-                *vol -= volume;
+                // will end at this level
+                *level_vol -= buy_vol;
                 self.best_ask = *price;
                 return Ok(());
             }
         }
-        Err(volume)
+        // we used up all the volume !?
+        Err(buy_vol)
     }
 
-    fn execute_sell_best_price(&mut self, mut volume: Volume) -> Result<(), Volume> {
-        for (price, vol) in self.levels.range_mut(..=self.best_bid).rev() {
-            if *vol < volume {
-                volume -= *vol;
-                *vol = Volume(0);
+    pub fn execute_sell_best_price(&mut self, mut sell_vol: Volume) -> Result<(), Volume> {
+        for (price, level_vol) in self.levels.range_mut(..=self.best_bid).rev() {
+            if sell_vol == Volume(0) {
+                // we're done
+                self.best_bid = *price;
+                return Ok(());
+            } else if sell_vol >= *level_vol {
+                // will exhause this level
+                sell_vol -= *level_vol;
+                *level_vol = Volume(0);
             } else {
-                *vol -= volume;
+                *level_vol -= sell_vol;
                 self.best_bid = *price;
                 return Ok(());
             }
         }
-        Err(volume)
+        // we used up all the volume !?
+        Err(sell_vol)
     }
 
-    fn spread(&self) -> Price {
+    pub fn spread(&self) -> Price {
         self.best_ask - self.best_bid
     }
+}
+
+pub enum Outcome {
+    PlacedExisting,
+    PlacedNew,
+    PlacedNewBest,
+    CrossedSpread,
 }
 
 #[cfg(test)]
@@ -190,12 +205,17 @@ mod tests {
 
         assert_eq!(ob.spread(), p(1));
 
-        ob.execute_buy_best_price(v(25)).expect("buy failed");
-        assert_eq!(ob.spread(), p(2));
-        ob.execute_sell_best_price(v(25)).expect("sell failed");
-        assert_eq!(ob.spread(), p(3));
+        ob.execute_buy_best_price(v(1)).expect("buy failed");
+        assert_eq!(ob.best_ask(), p(13));
+        ob.execute_buy_best_price(v(24)).expect("buy failed");
+        assert_eq!(ob.best_ask(), p(14));
+        ob.execute_buy_best_price(v(5)).expect("buy failed");
+        assert_eq!(ob.best_ask(), p(15));
 
-        assert_eq!(ob.execute_buy_best_price(v(100)), Err(v(65)));
-        assert_eq!(ob.execute_sell_best_price(v(200)), Err(v(165)));
+        ob.execute_sell_best_price(v(10)).expect("sell failed");
+        assert_eq!(ob.best_bid(), p(11));
+
+        assert_eq!(ob.execute_buy_best_price(v(100)), Err(v(70)));
+        assert_eq!(ob.execute_sell_best_price(v(200)), Err(v(150)));
     }
 }
