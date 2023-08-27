@@ -136,17 +136,18 @@ impl OrderBook {
 
     pub fn execute_market_buy(
         &mut self,
-        mut buy_vol: Volume,
+        target_vol: Volume,
         fills: &mut Vec<Fill>,
     ) -> Result<(), Volume> {
+        let mut remaining_buy_vol = target_vol;
         for (price, (level_vol, quotes)) in self.levels.range_mut(self.best_ask..) {
-            if buy_vol == Volume(0) {
+            if remaining_buy_vol == Volume(0) {
                 // we're done
                 self.best_ask = *price;
                 return Ok(());
-            } else if buy_vol >= *level_vol {
+            } else if remaining_buy_vol >= *level_vol {
                 // will exhaust this level
-                buy_vol -= *level_vol;
+                remaining_buy_vol -= *level_vol;
                 *level_vol = Volume(0);
                 for q in quotes.iter() {
                     if q.is_tombstone() {
@@ -160,7 +161,7 @@ impl OrderBook {
                 // so we can set the best price correctly
             } else {
                 // will end at this level
-                *level_vol -= buy_vol;
+                *level_vol -= remaining_buy_vol;
                 self.best_ask = *price;
 
                 for q in quotes {
@@ -168,10 +169,13 @@ impl OrderBook {
                         //tombstone, ignore
                         continue;
                     }
-                    if buy_vol < q.volume {
+                    if remaining_buy_vol < q.volume {
                         // partial fill (and we're done)
-                        q.volume -= buy_vol;
-                        fills.push(Fill::new(q.order_id, FillCompletion::Partial(buy_vol)));
+                        q.volume -= remaining_buy_vol;
+                        fills.push(Fill::new(
+                            q.order_id,
+                            FillCompletion::Partial(remaining_buy_vol),
+                        ));
                         break;
                     } else {
                         // complete fill (and continue)
@@ -182,8 +186,8 @@ impl OrderBook {
                 return Ok(());
             }
         }
-        // we used up all the volume !?
-        Err(buy_vol)
+        // if we get here then we used up all the volume
+        Err(target_vol - remaining_buy_vol)
     }
 
     pub fn execute_market_sell(&mut self, mut sell_vol: Volume) -> Result<(), Volume> {
@@ -270,6 +274,7 @@ fn listen(rx_order: Receiver<Order>, tx_fill: Sender<Fill>) -> Result<(), ()> {
                 for &fill in fills_buffer.iter() {
                     tx_fill.send(fill);
                 }
+                fills_buffer.clear();
             }
             Order::MarketSell { volume } => {
                 todo!()
@@ -299,6 +304,20 @@ mod tests {
             order_id: OrderId(q),
             volume: Volume(v),
         }
+    }
+
+    fn quick_book() -> OrderBook {
+        let mut ob = OrderBook::new();
+        ob.add_bid(p(10), q(1, 40));
+        ob.add_bid(p(15), q(2, 30));
+        ob.add_bid(p(20), q(3, 20));
+        ob.add_bid(p(25), q(4, 10));
+
+        ob.add_ask(p(35), q(5, 10));
+        ob.add_ask(p(40), q(6, 20));
+        ob.add_ask(p(45), q(7, 30));
+        ob.add_ask(p(50), q(8, 40));
+        ob
     }
 
     #[test]
@@ -333,49 +352,44 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_best_price() {
+    fn test_execute_market_buy() {
         use FillCompletion as FC;
-        let mut ob = OrderBook::new();
-        ob.add_bid(p(10), q(1, 30));
-        ob.add_bid(p(11), q(2, 20));
-        ob.add_bid(p(12), q(3, 10));
+        let mut ob = quick_book();
 
-        ob.add_ask(p(13), q(4, 10));
-        ob.add_ask(p(14), q(5, 20));
-        ob.add_ask(p(15), q(6, 30));
-
-        assert_eq!(ob.spread(), p(1));
+        assert_eq!(ob.spread(), p(10));
 
         {
             let mut fills = Vec::new();
             ob.execute_market_buy(v(1), &mut fills).expect("buy failed");
-            let expect_fills = &[Fill::new(o(4), FC::Partial(v(1)))];
+            let expect_fills = &[Fill::new(o(5), FC::Partial(v(1)))];
             assert_eq!(fills, expect_fills);
-            assert_eq!(ob.best_ask(), p(13));
+            assert_eq!(ob.best_ask(), p(35));
         }
         {
             let mut fills = Vec::new();
             ob.execute_market_buy(v(24), &mut fills)
                 .expect("buy failed");
             let expect_fills = &[
-                Fill::new(o(4), FC::Full),
-                Fill::new(o(5), FC::Partial(v(15))),
+                Fill::new(o(5), FC::Full),
+                Fill::new(o(6), FC::Partial(v(15))),
             ];
             assert_eq!(fills, expect_fills);
-            assert_eq!(ob.best_ask(), p(14));
+            assert_eq!(ob.best_ask(), p(40));
         }
         {
             let mut fills = Vec::new();
             ob.execute_market_buy(v(5), &mut fills).expect("buy failed");
-            let expect_fills = &[Fill::new(o(5), FC::Full)];
+            let expect_fills = &[Fill::new(o(6), FC::Full)];
             assert_eq!(fills, expect_fills);
-            assert_eq!(ob.best_ask(), p(15));
+            assert_eq!(ob.best_ask(), p(45));
         }
-
-        // ob.execute_market_sell(v(10)).expect("sell failed");
-        // assert_eq!(ob.best_bid(), p(11));
-
-        // assert_eq!(ob.execute_market_buy(v(100), &mut fills), Err(v(70)));
-        // assert_eq!(ob.execute_market_sell(v(200)), Err(v(150)));
+        {
+            let mut fills = Vec::new();
+            let filled_vol = ob.execute_market_buy(v(500), &mut fills).unwrap_err();
+            assert_eq!(filled_vol, v(70));
+            let expect_fills = &[Fill::new(o(7), FC::Full), Fill::new(o(8), FC::Full)];
+            assert_eq!(fills, expect_fills);
+            assert_eq!(ob.best_ask(), p(45));
+        }
     }
 }
