@@ -8,3 +8,10 @@ edition = "2021"
 [dependencies]
 crossbeam-channel = "0.5.8"
 derive_more = "0.99.17"
+
+[[bench]]
+name = "orderbook"
+harness = false
+
+[dev-dependencies]
+criterion = "0.5.1"

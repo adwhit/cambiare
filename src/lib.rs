@@ -20,6 +20,7 @@ macro_rules! newtype {
             derive_more::AddAssign,
             derive_more::Sub,
             derive_more::SubAssign,
+            derive_more::Constructor,
         )]
         pub struct $newtype(u64);
     };
@@ -36,6 +37,7 @@ pub struct OrderBook {
     levels: BTreeMap<Price, (Volume, Vec<Quote>)>,
 }
 
+#[derive(derive_more::Constructor)]
 pub struct Quote {
     order_id: OrderId,
     volume: Volume,
