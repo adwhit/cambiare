@@ -139,6 +139,10 @@ impl OrderBook {
         self.best_ask
     }
 
+    pub fn spread(&self) -> Price {
+        self.best_ask - self.best_bid
+    }
+
     pub fn add_bid(&mut self, price: Price, quote: Quote) -> Outcome {
         if self.best_ask <= price {
             return Outcome::CrossedSpread;
@@ -231,9 +235,25 @@ impl OrderBook {
         res
     }
 
-    pub fn spread(&self) -> Price {
-        self.best_ask - self.best_bid
+    fn cancel(&mut self, price: Price, order_id: OrderId) -> Cancellation {
+        let Some(level) = self.levels.get_mut(&price) else {
+            return Cancellation::NotFound;
+        };
+        for q in level.quotes.iter_mut() {
+            if q.order_id == order_id {
+                level.total_volume -= q.volume;
+                *q = Quote::tombstone();
+                level.tombstone_count += 1;
+                return Cancellation::WasCancelled;
+            }
+        }
+        Cancellation::NotFound
     }
+}
+
+enum Cancellation {
+    WasCancelled,
+    NotFound,
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -341,6 +361,10 @@ pub enum OrderType {
         price: Price,
         volume: Volume,
     },
+    Cancel {
+        price: Price,
+        order_id: OrderId,
+    },
 }
 
 pub struct Order {
@@ -379,6 +403,13 @@ pub fn run_orderbook_event_loop(rx_order: Receiver<Order>, tx_fill: Sender<Fill>
             }
             OrderType::LimitBuy { .. } => todo!(),
             OrderType::LimitSell { .. } => todo!(),
+            OrderType::Cancel { price, order_id } => {
+                match book.cancel(price, order_id) {
+                    Cancellation::WasCancelled => todo!(),
+                    Cancellation::NotFound => todo!(),
+                };
+                continue;
+            }
         }
         for &fill in fills_buffer.iter() {
             tx_fill.send(fill).expect("tx_fill send failed");
@@ -620,5 +651,24 @@ mod tests {
         assert_eq!(f1, f(1));
         assert_eq!(f2, fp(2, 10));
         assert!(rx_fill.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_order_cancellation() {
+        let mut book = quick_book();
+        assert!(matches!(
+            book.cancel(p(15), o(2)),
+            Cancellation::WasCancelled
+        ));
+        assert!(matches!(book.cancel(p(15), o(2)), Cancellation::NotFound));
+        assert!(matches!(book.cancel(p(20), o(222)), Cancellation::NotFound));
+        assert!(matches!(
+            book.cancel(p(35), o(5)),
+            Cancellation::WasCancelled
+        ));
+        assert_eq!(book.ask_volume(), v(90));
+        let mut fills = Vec::new();
+        book.execute_market_buy(v(1), &mut fills).result().unwrap();
+        assert_eq!(fills, &[fp(6, 1)]);
     }
 }
