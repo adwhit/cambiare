@@ -98,7 +98,11 @@ struct AccountOrder {
     order: Order,
 }
 
-pub fn run_account_event_loop(rx_acct_event: Receiver<AccountEvent>) {
+pub fn run_account_event_loop(
+    rx_acct_event: Receiver<AccountEvent>,
+    tx_order: Sender<Order>,
+    tx_outcome: Sender<String>,
+) {
     let mut accounts = Accounts::default();
     for ev in rx_acct_event {
         match ev.event {
@@ -107,8 +111,25 @@ pub fn run_account_event_loop(rx_acct_event: Receiver<AccountEvent>) {
                 let bal = entry.balances.entry(currency).or_default();
                 *bal += balance;
             }
-            AccountEventType::Withdraw { currency, balance } => todo!(),
-            AccountEventType::PlaceOrder(_) => todo!(),
+            AccountEventType::Withdraw { currency, balance } => {
+                let Some(acct) = accounts.accounts.get_mut(&ev.user_id) else {
+                    tx_outcome.send("insufficient balance".into()).unwrap();
+                    continue;
+                };
+                let Some(bal) = acct.balances.get_mut(&currency) else {
+                    tx_outcome.send("insufficient balance".into()).unwrap();
+                    continue;
+                };
+                if *bal < balance {
+                    tx_outcome.send("insufficient balance".into()).unwrap();
+                    continue;
+                }
+                *bal += balance;
+                tx_outcome.send("balance withdrawn".into()).unwrap();
+            }
+            AccountEventType::PlaceOrder(_) => {
+                todo!()
+            }
         }
     }
 }

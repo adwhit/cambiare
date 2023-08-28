@@ -2,7 +2,7 @@ use std::collections::{btree_map::Entry, BTreeMap};
 
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::{OrderId, Price, Volume};
+use crate::{Balance, OrderId, Price, Volume};
 
 const LEVEL_QUOTE_INIT_CAPACITY: usize = 128;
 const TOMBSTONE_GC_LIMIT: u32 = 1000;
@@ -325,10 +325,22 @@ pub enum FillCompletion {
 }
 
 pub enum OrderType {
-    MarketBuy { volume: Volume },
-    MarketSell { volume: Volume },
-    LimitBuy { price: Price, volume: Volume },
-    LimitSell { price: Price, volume: Volume },
+    MarketBuy {
+        volume: Volume,
+        bid_balance: Balance,
+    },
+    MarketSell {
+        volume: Volume,
+        ask_balance: Balance,
+    },
+    LimitBuy {
+        price: Price,
+        volume: Volume,
+    },
+    LimitSell {
+        price: Price,
+        volume: Volume,
+    },
 }
 
 pub struct Order {
@@ -341,7 +353,10 @@ pub fn run_orderbook_event_loop(rx_order: Receiver<Order>, tx_fill: Sender<Fill>
     let mut fills_buffer = Vec::with_capacity(1000);
     for order in rx_order {
         match order.typ {
-            OrderType::MarketBuy { volume } => {
+            OrderType::MarketBuy {
+                volume,
+                bid_balance,
+            } => {
                 let fill = match book.execute_market_buy(volume, &mut fills_buffer) {
                     MarketTxnOutcome::Success { .. } => Fill::new(order.id, FillCompletion::Full),
                     MarketTxnOutcome::InsufficientVolume { volume_transacted } => {
@@ -350,7 +365,10 @@ pub fn run_orderbook_event_loop(rx_order: Receiver<Order>, tx_fill: Sender<Fill>
                 };
                 fills_buffer.push(fill)
             }
-            OrderType::MarketSell { volume } => {
+            OrderType::MarketSell {
+                volume,
+                ask_balance,
+            } => {
                 let fill = match book.execute_market_sell(volume, &mut fills_buffer) {
                     MarketTxnOutcome::Success { .. } => Fill::new(order.id, FillCompletion::Full),
                     MarketTxnOutcome::InsufficientVolume { volume_transacted } => {
@@ -372,6 +390,9 @@ pub fn run_orderbook_event_loop(rx_order: Receiver<Order>, tx_fill: Sender<Fill>
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn b(v: u64) -> Balance {
+        Balance::new(v)
+    }
     fn p(v: u64) -> Price {
         Price::new(v)
     }
@@ -405,7 +426,10 @@ mod tests {
     fn mb(id: u64, vol: u64) -> Order {
         Order {
             id: o(id),
-            typ: OrderType::MarketBuy { volume: v(vol) },
+            typ: OrderType::MarketBuy {
+                volume: v(vol),
+                bid_balance: b(10000),
+            },
         }
     }
 
