@@ -363,27 +363,25 @@ pub enum Order {
     LimitSell { price: Price, volume: Volume },
 }
 
-pub fn listen(rx_order: Receiver<Order>, tx_fill: Sender<Fill>) -> Result<(), ()> {
+pub fn run_orderbook(rx_order: Receiver<Order>, tx_fill: Sender<Fill>) {
     let mut book = OrderBook::new();
     let mut fills_buffer = Vec::with_capacity(1000);
     for ev in rx_order {
         match ev {
             Order::MarketBuy { volume } => {
                 book.execute_market_buy(volume, &mut fills_buffer);
-                for &fill in fills_buffer.iter() {
-                    tx_fill.send(fill);
-                }
-                fills_buffer.clear();
             }
             Order::MarketSell { volume } => {
-                todo!()
-                // book.execute_market_sell(volume, &mut fills_buffer);
+                book.execute_market_sell(volume, &mut fills_buffer);
             }
-            Order::LimitBuy { price, volume } => {}
-            Order::LimitSell { price, volume } => todo!(),
+            Order::LimitBuy { .. } => todo!(),
+            Order::LimitSell { .. } => todo!(),
         }
+        for &fill in fills_buffer.iter() {
+            tx_fill.send(fill).expect("tx_fill send failed");
+        }
+        fills_buffer.clear();
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -409,6 +407,15 @@ mod tests {
             order_id: OrderId(q),
             volume: Volume(v),
         }
+    }
+    fn lb(price: u64, vol: u64) -> Order {
+        Order::LimitBuy {
+            price: p(price),
+            volume: v(vol),
+        }
+    }
+    fn mb(vol: u64) -> Order {
+        Order::MarketBuy { volume: v(vol) }
     }
 
     fn quick_book() -> OrderBook {
@@ -554,7 +561,49 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_vol() {
-        let book = OrderBook::new();
+    fn test_zero_volume_scenarios() {
+        let mut book = OrderBook::new();
+        let mut fills = Vec::new();
+        {
+            // TODO a zero-volume order should probably return success?
+            book.execute_market_buy(v(0), &mut fills)
+                .result()
+                .unwrap_err();
+            book.execute_market_sell(v(0), &mut fills)
+                .result()
+                .unwrap_err();
+        }
+        {
+            book.execute_market_buy(v(10), &mut fills)
+                .result()
+                .unwrap_err();
+            book.execute_market_sell(v(10), &mut fills)
+                .result()
+                .unwrap_err();
+        }
+        {
+            book.add_ask(p(20), q(1, 10));
+            book.add_bid(p(10), q(1, 10));
+            book.execute_market_buy(v(0), &mut fills).result().unwrap();
+            book.execute_market_sell(v(0), &mut fills).result().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_run_order_book() {
+        let (tx_order, rx_order) = crossbeam_channel::bounded(1000);
+        let (tx_fill, rx_fill) = crossbeam_channel::bounded(1000);
+        std::thread::spawn(move || run_orderbook(rx_order, tx_fill));
+
+        tx_order.send(lb(10, 30)).unwrap();
+        tx_order.send(lb(10, 20)).unwrap();
+        tx_order.send(lb(10, 10)).unwrap();
+        tx_order.send(mb(20)).unwrap();
+
+        let f1 = rx_fill.try_recv().unwrap();
+        let f2 = rx_fill.try_recv().unwrap();
+        assert_eq!(f1, f(1));
+        assert_eq!(f2, fp(2, 10));
+        assert!(rx_fill.try_recv().is_err());
     }
 }
