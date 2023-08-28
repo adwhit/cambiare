@@ -244,6 +244,7 @@ impl OrderBook {
                 level.total_volume -= q.volume;
                 *q = Quote::tombstone();
                 level.tombstone_count += 1;
+                level.maybe_compact();
                 return Cancellation::WasCancelled;
             }
         }
@@ -670,5 +671,28 @@ mod tests {
         let mut fills = Vec::new();
         book.execute_market_buy(v(1), &mut fills).result().unwrap();
         assert_eq!(fills, &[fp(6, 1)]);
+    }
+
+    #[test]
+    fn test_compactify() {
+        let mut book = quick_book();
+        for id in 0..TOMBSTONE_GC_LIMIT - 1 {
+            // build up a load of tombstones
+            book.add_ask(p(30), q((id + 20) as u64, 10));
+            book.cancel(p(30), o((id + 20) as u64));
+        }
+        {
+            let level = book.levels.get(&p(30)).unwrap();
+            assert_eq!(level.quotes.len() as u32, TOMBSTONE_GC_LIMIT - 1);
+            assert_eq!(level.tombstone_count, TOMBSTONE_GC_LIMIT - 1);
+        }
+        // trigger a compactification
+        book.add_ask(p(30), q(333333, 10));
+        book.cancel(p(30), o(333333));
+        {
+            let level = book.levels.get(&p(30)).unwrap();
+            assert_eq!(level.quotes.len(), 0);
+            assert_eq!(level.tombstone_count, 0);
+        }
     }
 }
