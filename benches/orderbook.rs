@@ -1,26 +1,76 @@
 use cambiare::{OrderBook, OrderId, Price, Quote, Volume};
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 
 pub fn orderbook_benchmark(c: &mut Criterion) {
-    c.bench_function("add 5 asks and execute market buy", |b| {
+    c.bench_function("simple-market-buy", |b| {
         let mut book = OrderBook::new();
         let mut fills = Vec::new();
         b.iter(|| {
-            for (order_id, price, vol) in [
-                (1, 100, 100),
-                (2, 200, 100),
-                (3, 300, 100),
-                (4, 400, 100),
-                (5, 500, 100),
+            book.add_ask(
+                Price::new(500),
+                Quote::new(OrderId::new(1), Volume::new(50)),
+            );
+            let _ = book
+                .execute_market_buy(Volume::new(500), &mut fills)
+                .result()
+                .unwrap_err();
+            fills.clear()
+        });
+    });
+
+    c.bench_function("simple-market-sell", |b| {
+        let mut book = OrderBook::new();
+        let mut fills = Vec::new();
+        b.iter(|| {
+            book.add_bid(
+                Price::new(500),
+                Quote::new(OrderId::new(1), Volume::new(50)),
+            );
+            let _ = book
+                .execute_market_sell(Volume::new(500), &mut fills)
+                .result()
+                .unwrap_err();
+            fills.clear()
+        });
+    });
+
+    c.bench_function("add-500-volume-and-execute-market-buy", |b| {
+        let mut book = OrderBook::new();
+        book.add_ask(
+            Price::new(500),
+            Quote::new(OrderId::new(1), Volume::new(50)),
+        );
+        let mut fills = Vec::new();
+        b.iter(|| {
+            // println!("ITER");
+            // assert_eq!(book.ask_volume(), Volume::new(50));
+            // add 500 volume, sell 500 volume (leaving 'original' 50 volume)
+            // this will ensure tombstones are generated
+            for (order_id, (price, vol)) in [
+                (100, 100),
+                (200, 100),
+                (400, 50),
+                (300, 50),
+                (400, 50),
+                (500, 50),
+                (500, 50),
+                (100, 50),
             ]
             .into_iter()
+            .enumerate()
             {
                 book.add_ask(
                     Price::new(price),
-                    Quote::new(OrderId::new(order_id), Volume::new(vol)),
+                    Quote::new(OrderId::new((order_id + 1) as u64), Volume::new(vol)),
                 );
             }
-            book.execute_market_buy(Volume::new(1000), &mut fills);
+
+            let _ = book
+                .execute_market_buy(Volume::new(500), &mut fills)
+                .result()
+                .unwrap();
+            // assert_eq!(fills.len(), 8);
+            // assert_eq!(book.ask_volume(), Volume::new(50));
             fills.clear();
         })
     });

@@ -10,7 +10,6 @@ macro_rules! newtype {
             PartialEq,
             Eq,
             Hash,
-            Debug,
             Clone,
             Copy,
             Default,
@@ -21,8 +20,14 @@ macro_rules! newtype {
             derive_more::Sub,
             derive_more::SubAssign,
             derive_more::Constructor,
+            derive_more::Display,
         )]
         pub struct $newtype(u64);
+        impl std::fmt::Debug for $newtype {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
     };
 }
 
@@ -31,17 +36,66 @@ newtype!(Volume);
 newtype!(UserId);
 newtype!(OrderId);
 
-pub struct OrderBook {
-    best_ask: Price,
-    best_bid: Price,
-    levels: BTreeMap<Price, (Volume, Vec<Quote>)>,
+const LEVEL_QUOTE_INIT_CAPACITY: usize = 128;
+const TOMBSTONE_GC_LIMIT: u32 = 1000;
+
+#[derive(Clone, Debug)]
+pub struct Level {
+    total_volume: Volume,
+    quotes: Vec<Quote>,
+    tombstone_count: u32,
 }
 
-#[derive(derive_more::Constructor)]
+impl Level {
+    fn iter_quotes(&self) -> impl Iterator<Item = &Quote> {
+        self.quotes.iter().filter(|q| !q.is_tombstone())
+    }
+    fn iter_quotes_mut(&mut self) -> impl Iterator<Item = &mut Quote> {
+        self.quotes.iter_mut().filter(|q| !q.is_tombstone())
+    }
+    fn compact(&mut self) {
+        self.quotes.retain(|q| !q.is_tombstone());
+        self.tombstone_count = 0;
+    }
+
+    fn maybe_compact(&mut self) {
+        if self.tombstone_count >= TOMBSTONE_GC_LIMIT {
+            self.compact();
+        }
+    }
+    fn clear(&mut self) {
+        self.total_volume = Volume(0);
+        self.quotes.clear();
+        self.tombstone_count = 0;
+    }
+}
+
+impl Default for Level {
+    fn default() -> Self {
+        Self {
+            total_volume: Volume(0),
+            quotes: Vec::with_capacity(LEVEL_QUOTE_INIT_CAPACITY),
+            tombstone_count: 0,
+        }
+    }
+}
+
+#[derive(Copy, Clone, derive_more::Constructor)]
 pub struct Quote {
     order_id: OrderId,
     volume: Volume,
 }
+
+impl std::fmt::Debug for Quote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_tombstone() {
+            write!(f, "TOMBSTONE")
+        } else {
+            write!(f, "Q({:?} -> {:?})", self.order_id, self.volume)
+        }
+    }
+}
+
 impl Quote {
     fn tombstone() -> Quote {
         Quote {
@@ -55,10 +109,28 @@ impl Quote {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, derive_more::Constructor)]
+#[derive(Copy, Clone, PartialEq, Eq, derive_more::Constructor)]
 pub struct Fill {
     order_id: OrderId,
     completion: FillCompletion,
+}
+
+impl std::fmt::Debug for Fill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Fill({:?} -> {:?})", self.order_id, self.completion)
+    }
+}
+
+pub struct OrderBook {
+    best_ask: Price,
+    best_bid: Price,
+    levels: BTreeMap<Price, Level>,
+}
+
+impl Default for OrderBook {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OrderBook {
@@ -68,6 +140,27 @@ impl OrderBook {
             best_bid: Price(u64::MIN),
             levels: BTreeMap::new(),
         }
+    }
+
+    pub fn ask_levels(&self) -> impl Iterator<Item = (&Price, &Level)> {
+        self.levels.range(self.best_ask..)
+    }
+
+    pub fn ask_levels_mut(&mut self) -> impl Iterator<Item = (&Price, &mut Level)> {
+        self.levels.range_mut(self.best_ask..)
+    }
+
+    pub fn bid_levels(&self) -> impl Iterator<Item = (&Price, &Level)> {
+        self.levels.range(..=self.best_bid).rev()
+    }
+
+    pub fn bid_levels_mut(&mut self) -> impl Iterator<Item = (&Price, &mut Level)> {
+        self.levels.range_mut(..=self.best_bid).rev()
+    }
+
+    pub fn ask_volume(&self) -> Volume {
+        self.ask_levels()
+            .fold(Volume(0), |acc, (_, lvl)| acc + lvl.total_volume)
     }
 
     pub fn best_bid(&self) -> Price {
@@ -87,14 +180,19 @@ impl OrderBook {
             // new level
             Entry::Vacant(v) => {
                 did_update = false;
-                v.insert((quote.volume, vec![quote]));
+                let level = Level {
+                    total_volume: quote.volume,
+                    quotes: vec![quote],
+                    tombstone_count: 0,
+                };
+                v.insert(level);
             }
             // existing level
             Entry::Occupied(mut o) => {
-                let (vol, quotes) = o.get_mut();
-                did_update = *vol != Volume(0);
-                *vol += quote.volume;
-                quotes.push(quote);
+                let level = o.get_mut();
+                did_update = level.total_volume != Volume(0);
+                level.total_volume += quote.volume;
+                level.quotes.push(quote);
             }
         }
         if self.best_bid < price {
@@ -116,13 +214,18 @@ impl OrderBook {
         match self.levels.entry(price) {
             Entry::Vacant(v) => {
                 did_update = false;
-                v.insert((quote.volume, vec![quote]));
+                let level = Level {
+                    total_volume: quote.volume,
+                    quotes: vec![quote],
+                    tombstone_count: 0,
+                };
+                v.insert(level);
             }
             Entry::Occupied(mut o) => {
-                let (vol, quotes) = o.get_mut();
-                did_update = *vol != Volume(0);
-                *vol += quote.volume;
-                quotes.push(quote);
+                let level = o.get_mut();
+                did_update = level.total_volume != Volume(0);
+                level.total_volume += quote.volume;
+                level.quotes.push(quote);
             }
         }
         if self.best_ask > price {
@@ -140,109 +243,103 @@ impl OrderBook {
         &mut self,
         target_vol: Volume,
         fills: &mut Vec<Fill>,
-    ) -> Result<(), Volume> {
-        let mut remaining_buy_vol = target_vol;
-        for (price, (level_vol, quotes)) in self.levels.range_mut(self.best_ask..) {
-            if remaining_buy_vol == Volume(0) {
-                // we're done
-                self.best_ask = *price;
-                return Ok(());
-            } else if remaining_buy_vol >= *level_vol {
-                // will exhaust this level
-                remaining_buy_vol -= *level_vol;
-                *level_vol = Volume(0);
-                for q in quotes.iter() {
-                    if q.is_tombstone() {
-                        // ignore
-                        continue;
-                    }
-                    fills.push(Fill::new(q.order_id, FillCompletion::Full));
-                }
-                quotes.clear();
-                // don't return here - continue to next price level
-                // so we can set the best price correctly
-            } else {
-                // will end at this level
-                *level_vol -= remaining_buy_vol;
-                self.best_ask = *price;
-
-                for q in quotes {
-                    if q.is_tombstone() {
-                        //tombstone, ignore
-                        continue;
-                    }
-                    if remaining_buy_vol < q.volume {
-                        // partial fill (and we're done)
-                        q.volume -= remaining_buy_vol;
-                        fills.push(Fill::new(
-                            q.order_id,
-                            FillCompletion::Partial(remaining_buy_vol),
-                        ));
-                        break;
-                    } else {
-                        // complete fill (and continue)
-                        fills.push(Fill::new(q.order_id, FillCompletion::Full));
-                        *q = Quote::tombstone();
-                    }
-                }
-                return Ok(());
-            }
-        }
-        // if we get here then we used up all the volume
-        Err(target_vol - remaining_buy_vol)
+    ) -> MarketTxnOutcome {
+        let res = execute_market_txn(self.ask_levels_mut(), target_vol, fills);
+        if let MarketTxnOutcome::Success { new_best_price } = res {
+            self.best_ask = new_best_price
+        };
+        res
     }
 
-    pub fn execute_market_sell(&mut self, mut sell_vol: Volume) -> Result<(), Volume> {
-        todo!()
-        // for (price, level_vol) in self.levels.range_mut(..=self.best_bid).rev() {
-        //     if sell_vol == Volume(0) {
-        //         // we're done
-        //         self.best_bid = *price;
-        //         return Ok(());
-        //     } else if sell_vol >= *level_vol {
-        //         // will exhause this level
-        //         sell_vol -= *level_vol;
-        //         *level_vol = Volume(0);
-        //     } else {
-        //         *level_vol -= sell_vol;
-        //         self.best_bid = *price;
-        //         return Ok(());
-        //     }
-        // }
-        // // we used up all the volume !?
-        // Err(sell_vol)
+    pub fn execute_market_sell(
+        &mut self,
+        target_vol: Volume,
+        fills: &mut Vec<Fill>,
+    ) -> MarketTxnOutcome {
+        let res = execute_market_txn(self.bid_levels_mut(), target_vol, fills);
+        if let MarketTxnOutcome::Success { new_best_price } = res {
+            self.best_bid = new_best_price
+        };
+        res
     }
-
-    // pub fn execute_limit_buy(
-    //     &mut self,
-    //     limit_price: Price,
-    //     mut buy_vol: Volume,
-    // ) -> Result<(), Volume> {
-    //     if self.best_ask > limit_price {
-    //         todo!()
-    //     }
-    //     for (price, level_vol) in self.levels.range_mut(self.best_ask..) {
-    //         if buy_vol == Volume(0) {
-    //             // we're done
-    //             self.best_ask = *price;
-    //             return Ok(());
-    //         } else if buy_vol >= *level_vol {
-    //             // will exhaust this level
-    //             buy_vol -= *level_vol;
-    //             *level_vol = Volume(0);
-    //         } else {
-    //             // will end at this level
-    //             *level_vol -= buy_vol;
-    //             self.best_ask = *price;
-    //             return Ok(());
-    //         }
-    //     }
-    //     // we used up all the volume !?
-    //     Err(buy_vol)
-    // }
 
     pub fn spread(&self) -> Price {
         self.best_ask - self.best_bid
+    }
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum MarketTxnOutcome {
+    Success { new_best_price: Price },
+    InsufficientVolume { volume_transacted: Volume },
+}
+
+impl MarketTxnOutcome {
+    pub fn result(self) -> Result<Price, Volume> {
+        match self {
+            MarketTxnOutcome::Success { new_best_price } => Ok(new_best_price),
+            MarketTxnOutcome::InsufficientVolume { volume_transacted } => Err(volume_transacted),
+        }
+    }
+}
+
+fn execute_market_txn<'a>(
+    price_levels: impl Iterator<Item = (&'a Price, &'a mut Level)>,
+    target_vol: Volume,
+    fills: &mut Vec<Fill>,
+) -> MarketTxnOutcome {
+    let mut remaining_txn_vol = target_vol;
+    for (price, level) in price_levels {
+        if remaining_txn_vol == Volume(0) {
+            // we're done
+            return MarketTxnOutcome::Success {
+                new_best_price: *price,
+            };
+        } else if remaining_txn_vol >= level.total_volume {
+            // will exhaust this level
+            remaining_txn_vol -= level.total_volume;
+            for q in level.iter_quotes() {
+                fills.push(Fill::new(q.order_id, FillCompletion::Full));
+            }
+            level.clear();
+            // continue to next price level
+        } else {
+            // will end at this level
+            level.total_volume -= remaining_txn_vol;
+
+            let mut tombstone_inc = 0;
+            for q in level.iter_quotes_mut() {
+                if remaining_txn_vol < q.volume {
+                    // partial fill (and we're done)
+                    q.volume -= remaining_txn_vol;
+                    fills.push(Fill::new(
+                        q.order_id,
+                        FillCompletion::Partial(remaining_txn_vol),
+                    ));
+                    break;
+                } else if remaining_txn_vol == q.volume {
+                    fills.push(Fill::new(q.order_id, FillCompletion::Full));
+                    *q = Quote::tombstone();
+                    break;
+                } else {
+                    // complete fill (and continue)
+                    remaining_txn_vol -= q.volume;
+                    fills.push(Fill::new(q.order_id, FillCompletion::Full));
+                    *q = Quote::tombstone();
+                    tombstone_inc += 1;
+                }
+            }
+            level.tombstone_count += tombstone_inc;
+            level.maybe_compact();
+            // we're done
+            return MarketTxnOutcome::Success {
+                new_best_price: *price,
+            };
+        }
+    }
+    // if we get here then we used up all the volume
+    MarketTxnOutcome::InsufficientVolume {
+        volume_transacted: target_vol - remaining_txn_vol,
     }
 }
 
@@ -259,14 +356,14 @@ pub enum FillCompletion {
     Partial(Volume),
 }
 
-enum Order {
+pub enum Order {
     MarketBuy { volume: Volume },
     MarketSell { volume: Volume },
     LimitBuy { price: Price, volume: Volume },
     LimitSell { price: Price, volume: Volume },
 }
 
-fn listen(rx_order: Receiver<Order>, tx_fill: Sender<Fill>) -> Result<(), ()> {
+pub fn listen(rx_order: Receiver<Order>, tx_fill: Sender<Fill>) -> Result<(), ()> {
     let mut book = OrderBook::new();
     let mut fills_buffer = Vec::with_capacity(1000);
     for ev in rx_order {
@@ -300,6 +397,12 @@ mod tests {
     }
     fn o(v: u64) -> OrderId {
         OrderId(v)
+    }
+    fn f(i: u64) -> Fill {
+        Fill::new(o(i), FillCompletion::Full)
+    }
+    fn fp(i: u64, p: u64) -> Fill {
+        Fill::new(o(i), FillCompletion::Partial(v(p)))
     }
     fn q(q: u64, v: u64) -> Quote {
         Quote {
@@ -355,43 +458,103 @@ mod tests {
 
     #[test]
     fn test_execute_market_buy() {
-        use FillCompletion as FC;
         let mut ob = quick_book();
 
         assert_eq!(ob.spread(), p(10));
 
         {
             let mut fills = Vec::new();
-            ob.execute_market_buy(v(1), &mut fills).expect("buy failed");
-            let expect_fills = &[Fill::new(o(5), FC::Partial(v(1)))];
+            ob.execute_market_buy(v(1), &mut fills)
+                .result()
+                .expect("buy failed");
+            let expect_fills = &[fp(5, 1)];
             assert_eq!(fills, expect_fills);
             assert_eq!(ob.best_ask(), p(35));
         }
         {
             let mut fills = Vec::new();
             ob.execute_market_buy(v(24), &mut fills)
+                .result()
                 .expect("buy failed");
-            let expect_fills = &[
-                Fill::new(o(5), FC::Full),
-                Fill::new(o(6), FC::Partial(v(15))),
-            ];
+            let expect_fills = &[f(5), fp(6, 15)];
             assert_eq!(fills, expect_fills);
             assert_eq!(ob.best_ask(), p(40));
         }
         {
             let mut fills = Vec::new();
-            ob.execute_market_buy(v(5), &mut fills).expect("buy failed");
-            let expect_fills = &[Fill::new(o(6), FC::Full)];
+            ob.execute_market_buy(v(5), &mut fills)
+                .result()
+                .expect("buy failed");
+            let expect_fills = &[f(6)];
             assert_eq!(fills, expect_fills);
             assert_eq!(ob.best_ask(), p(45));
         }
         {
             let mut fills = Vec::new();
-            let filled_vol = ob.execute_market_buy(v(500), &mut fills).unwrap_err();
+            let filled_vol = ob
+                .execute_market_buy(v(500), &mut fills)
+                .result()
+                .unwrap_err();
             assert_eq!(filled_vol, v(70));
-            let expect_fills = &[Fill::new(o(7), FC::Full), Fill::new(o(8), FC::Full)];
+            let expect_fills = &[f(7), f(8)];
             assert_eq!(fills, expect_fills);
             assert_eq!(ob.best_ask(), p(45));
         }
+    }
+
+    #[test]
+    fn test_execute_market_partial() {
+        let mut book = OrderBook::new();
+        book.add_ask(p(10), q(1, 10));
+        book.add_ask(p(10), q(2, 10));
+        book.add_ask(p(10), q(3, 10));
+
+        {
+            let mut fills = Vec::new();
+            let res = book.execute_market_buy(v(11), &mut fills);
+            assert_eq!(
+                res,
+                MarketTxnOutcome::Success {
+                    new_best_price: p(10)
+                }
+            );
+            let expect_fills = &[f(1), fp(2, 1)];
+            assert_eq!(fills, expect_fills);
+            assert_eq!(book.ask_volume(), v(19));
+        }
+        {
+            let mut fills = Vec::new();
+            let res = book.execute_market_buy(v(9), &mut fills);
+            assert_eq!(
+                res,
+                MarketTxnOutcome::Success {
+                    new_best_price: p(10)
+                }
+            );
+            let expect_fills = &[f(2)];
+            assert_eq!(fills, expect_fills);
+        }
+    }
+
+    #[test]
+    fn test_execute_market_sell_simple() {
+        let mut ob = quick_book();
+        {
+            let mut fills = Vec::new();
+            let res = ob.execute_market_sell(v(90), &mut fills);
+            assert_eq!(res.result().unwrap(), p(10));
+            assert_eq!(fills, &[f(4), f(3), f(2), fp(1, 30)])
+        }
+        {
+            let mut fills = Vec::new();
+            let res = ob.execute_market_sell(v(22), &mut fills);
+            assert_eq!(res.result().unwrap_err(), v(10));
+            assert_eq!(fills, &[f(1)])
+        }
+    }
+
+    #[test]
+    fn test_zero_vol() {
+        let book = OrderBook::new();
     }
 }
