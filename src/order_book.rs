@@ -77,15 +77,34 @@ impl Quote {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, derive_more::Constructor)]
-pub struct Fill {
-    order_id: OrderId,
-    completion: FillCompletion,
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum MatchType {
+    MakerFilled,
+    TakerFilled,
+    BothFilled,
 }
 
-impl std::fmt::Debug for Fill {
+#[derive(Copy, Clone, PartialEq, Eq, derive_more::Constructor)]
+pub struct Match {
+    maker_order_id: OrderId,
+    taker_order_id: OrderId,
+    price: Price,
+    volume: Volume,
+    typ: MatchType,
+}
+
+impl std::fmt::Debug for Match {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Fill({:?} -> {:?})", self.order_id, self.completion)
+        let (mf, tf) = match self.typ {
+            MatchType::MakerFilled => ("F", " "),
+            MatchType::TakerFilled => (" ", "F"),
+            MatchType::BothFilled => ("F", "F"),
+        };
+        write!(
+            f,
+            "Match({:?}{mf} <-> {:?}{tf} {}@{})",
+            self.maker_order_id, self.taker_order_id, self.volume, self.price
+        )
     }
 }
 
@@ -227,11 +246,17 @@ impl OrderBook {
         Cancellation::NotFound
     }
 
-    pub fn execute_market_buy(&mut self, target_vol: Volume, fills: &mut Vec<Fill>) -> TxnOutcome {
+    pub fn execute_market_buy(
+        &mut self,
+        order_id: OrderId,
+        target_vol: Volume,
+        fills: &mut Vec<Match>,
+    ) -> TxnOutcome {
         let res = execute_market_txn(
             self.ask_levels_mut(),
+            order_id,
             target_vol,
-            TargetPrice::Market,
+            OrderTarget::MarketBuy,
             fills,
         );
         if let TxnOutcome::Filled { new_best_price } = res {
@@ -240,11 +265,17 @@ impl OrderBook {
         res
     }
 
-    pub fn execute_market_sell(&mut self, target_vol: Volume, fills: &mut Vec<Fill>) -> TxnOutcome {
+    pub fn execute_market_sell(
+        &mut self,
+        order_id: OrderId,
+        target_vol: Volume,
+        fills: &mut Vec<Match>,
+    ) -> TxnOutcome {
         let res = execute_market_txn(
             self.bid_levels_mut(),
+            order_id,
             target_vol,
-            TargetPrice::Market,
+            OrderTarget::MarketSell,
             fills,
         );
         if let TxnOutcome::Filled { new_best_price } = res {
@@ -258,13 +289,14 @@ impl OrderBook {
         order_id: OrderId,
         target_price: Price,
         target_vol: Volume,
-        fills: &mut Vec<Fill>,
+        fills: &mut Vec<Match>,
     ) {
         // may fill or partially fill
         let res = execute_market_txn(
             self.ask_levels_mut(),
+            order_id,
             target_vol,
-            TargetPrice::Buy(target_price),
+            OrderTarget::LimitBuy(target_price),
             fills,
         );
         match res {
@@ -340,22 +372,24 @@ impl TxnOutcome {
     }
 }
 
-enum TargetPrice {
-    Buy(Price),
-    Sell(Price),
-    Market,
+enum OrderTarget {
+    LimitBuy(Price),
+    LimitSell(Price),
+    MarketBuy,
+    MarketSell,
 }
 
 fn execute_market_txn<'a>(
     price_levels: impl Iterator<Item = (&'a Price, &'a mut Level)>,
+    order_id: OrderId,
     target_vol: Volume,
-    target_price: TargetPrice,
-    fills: &mut Vec<Fill>,
+    target_price: OrderTarget,
+    matches: &mut Vec<Match>,
 ) -> TxnOutcome {
     let mut remaining_txn_vol = target_vol;
     for (&price, level) in price_levels {
         match target_price {
-            TargetPrice::Buy(max_buy_price) => {
+            OrderTarget::LimitBuy(max_buy_price) => {
                 if max_buy_price < price {
                     // we're done
                     return TxnOutcome::PartiallyFilled {
@@ -364,7 +398,7 @@ fn execute_market_txn<'a>(
                     };
                 }
             }
-            TargetPrice::Sell(min_sell_price) => {
+            OrderTarget::LimitSell(min_sell_price) => {
                 if min_sell_price > price {
                     // we're done
                     return TxnOutcome::PartiallyFilled {
@@ -373,7 +407,7 @@ fn execute_market_txn<'a>(
                     };
                 }
             }
-            TargetPrice::Market => {
+            OrderTarget::MarketBuy | OrderTarget::MarketSell => {
                 // no problem
             }
         }
@@ -386,7 +420,12 @@ fn execute_market_txn<'a>(
             // will exhaust this level
             remaining_txn_vol -= level.total_volume;
             for q in level.iter_quotes() {
-                fills.push(Fill::new(q.order_id, FillCompletion::Full));
+                let matchty = if remaining_txn_vol == Volume::new(0) {
+                    MatchType::BothFilled
+                } else {
+                    MatchType::MakerFilled
+                };
+                matches.push(Match::new(q.order_id, order_id, price, q.volume, matchty));
             }
             level.clear();
             // continue to next price level
@@ -397,21 +436,37 @@ fn execute_market_txn<'a>(
             let mut tombstone_inc = 0;
             for q in level.iter_quotes_mut() {
                 if remaining_txn_vol < q.volume {
-                    // partial fill (and we're done)
+                    // taker filled (and we're done)
                     q.volume -= remaining_txn_vol;
-                    fills.push(Fill::new(
+                    matches.push(Match::new(
                         q.order_id,
-                        FillCompletion::Partial(remaining_txn_vol),
+                        order_id,
+                        price,
+                        remaining_txn_vol,
+                        MatchType::TakerFilled,
                     ));
                     break;
                 } else if remaining_txn_vol == q.volume {
-                    fills.push(Fill::new(q.order_id, FillCompletion::Full));
+                    // both filled (and we're done)
+                    matches.push(Match::new(
+                        q.order_id,
+                        order_id,
+                        price,
+                        remaining_txn_vol,
+                        MatchType::BothFilled,
+                    ));
                     *q = Quote::tombstone();
                     break;
                 } else {
-                    // complete fill (and continue)
+                    // maker filled (and continue)
                     remaining_txn_vol -= q.volume;
-                    fills.push(Fill::new(q.order_id, FillCompletion::Full));
+                    matches.push(Match::new(
+                        q.order_id,
+                        order_id,
+                        price,
+                        q.volume,
+                        MatchType::MakerFilled,
+                    ));
                     *q = Quote::tombstone();
                     tombstone_inc += 1;
                 }
@@ -480,7 +535,7 @@ pub struct Order {
     typ: OrderType,
 }
 
-pub fn run_orderbook_event_loop(rx_order: Receiver<Order>, tx_fill: Sender<Fill>) {
+pub fn run_orderbook_event_loop(rx_order: Receiver<Order>, tx_fill: Sender<Match>) {
     let mut book = OrderBook::new();
     let mut fills_buffer = Vec::with_capacity(1000);
     for order in rx_order {
@@ -489,33 +544,19 @@ pub fn run_orderbook_event_loop(rx_order: Receiver<Order>, tx_fill: Sender<Fill>
                 volume,
                 bid_balance,
             } => {
-                let fill = match book.execute_market_buy(volume, &mut fills_buffer) {
-                    TxnOutcome::Filled { .. } => Fill::new(order.id, FillCompletion::Full),
-                    TxnOutcome::MarketVolumeExhausted { volume_transacted } => {
-                        Fill::new(order.id, FillCompletion::Partial(volume_transacted))
-                    }
-                    TxnOutcome::PartiallyFilled { .. } => unreachable!(),
-                };
-                fills_buffer.push(fill)
+                book.execute_market_buy(order.id, volume, &mut fills_buffer);
             }
             OrderType::MarketSell {
                 volume,
                 ask_balance,
             } => {
-                let fill = match book.execute_market_sell(volume, &mut fills_buffer) {
-                    TxnOutcome::Filled { .. } => Fill::new(order.id, FillCompletion::Full),
-                    TxnOutcome::MarketVolumeExhausted { volume_transacted } => {
-                        Fill::new(order.id, FillCompletion::Partial(volume_transacted))
-                    }
-                    TxnOutcome::PartiallyFilled { .. } => unreachable!(),
-                };
-                fills_buffer.push(fill)
+                book.execute_market_sell(order.id, volume, &mut fills_buffer);
             }
             OrderType::LimitBuy { .. } => todo!(),
             OrderType::LimitSell { .. } => todo!(),
             OrderType::Cancel { price, order_id } => {
                 match book.cancel(price, order_id) {
-                    Cancellation::WasCancelled => todo!(),
+                    Cancellation::WasCancelled => {}
                     Cancellation::NotFound => todo!(),
                 };
                 continue;
@@ -530,6 +571,8 @@ pub fn run_orderbook_event_loop(rx_order: Receiver<Order>, tx_fill: Sender<Fill>
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     fn b(v: u64) -> Balance {
         Balance::new(v)
@@ -543,11 +586,14 @@ mod tests {
     fn o(v: u64) -> OrderId {
         OrderId::new(v)
     }
-    fn f(i: u64) -> Fill {
-        Fill::new(o(i), FillCompletion::Full)
+    fn mm(maker: u64, taker: u64, price: u64, vol: u64) -> Match {
+        Match::new(o(maker), o(taker), p(price), v(vol), MatchType::MakerFilled)
     }
-    fn fp(i: u64, p: u64) -> Fill {
-        Fill::new(o(i), FillCompletion::Partial(v(p)))
+    fn mt(maker: u64, taker: u64, price: u64, vol: u64) -> Match {
+        Match::new(o(maker), o(taker), p(price), v(vol), MatchType::TakerFilled)
+    }
+    fn mb(maker: u64, taker: u64, price: u64, vol: u64) -> Match {
+        Match::new(o(maker), o(taker), p(price), v(vol), MatchType::BothFilled)
     }
     fn q(q: u64, v: u64) -> Quote {
         Quote {
@@ -564,7 +610,7 @@ mod tests {
             },
         }
     }
-    fn mb(id: u64, vol: u64) -> Order {
+    fn ob(id: u64, vol: u64) -> Order {
         Order {
             id: o(id),
             typ: OrderType::MarketBuy {
@@ -626,32 +672,34 @@ mod tests {
         assert_eq!(ob.spread(), p(10));
 
         {
-            let mut fills = Vec::new();
-            ob.execute_market_buy(v(1), &mut fills).filled();
-            let expect_fills = &[fp(5, 1)];
-            assert_eq!(fills, expect_fills);
+            let mut matches = Vec::new();
+            ob.execute_market_buy(o(100), v(1), &mut matches).filled();
+            let expect_fills = &[mt(5, 100, 35, 1)];
+            assert_eq!(matches, expect_fills);
             assert_eq!(ob.best_ask(), p(35));
         }
         {
-            let mut fills = Vec::new();
-            ob.execute_market_buy(v(24), &mut fills).filled();
-            let expect_fills = &[f(5), fp(6, 15)];
-            assert_eq!(fills, expect_fills);
+            let mut matches = Vec::new();
+            ob.execute_market_buy(o(101), v(24), &mut matches).filled();
+            let expect_fills = &[mm(5, 101, 35, 9), mt(6, 101, 40, 15)];
+            assert_eq!(matches, expect_fills);
             assert_eq!(ob.best_ask(), p(40));
         }
         {
-            let mut fills = Vec::new();
-            ob.execute_market_buy(v(5), &mut fills).filled();
-            let expect_fills = &[f(6)];
-            assert_eq!(fills, expect_fills);
+            let mut matches = Vec::new();
+            ob.execute_market_buy(o(102), v(5), &mut matches).filled();
+            let expect_fills = &[mb(6, 102, 40, 5)];
+            assert_eq!(matches, expect_fills);
             assert_eq!(ob.best_ask(), p(45));
         }
         {
-            let mut fills = Vec::new();
-            let filled_vol = ob.execute_market_buy(v(500), &mut fills).exhausted();
+            let mut matches = Vec::new();
+            let filled_vol = ob
+                .execute_market_buy(o(103), v(500), &mut matches)
+                .exhausted();
             assert_eq!(filled_vol, v(70));
-            let expect_fills = &[f(7), f(8)];
-            assert_eq!(fills, expect_fills);
+            let expect_fills = &[mm(7, 103, 45, 30), mm(8, 103, 50, 40)];
+            assert_eq!(matches, expect_fills);
             assert_eq!(ob.best_ask(), p(45));
         }
     }
@@ -665,27 +713,27 @@ mod tests {
 
         {
             let mut fills = Vec::new();
-            let res = book.execute_market_buy(v(11), &mut fills);
+            let res = book.execute_market_buy(o(100), v(11), &mut fills);
             assert_eq!(
                 res,
                 TxnOutcome::Filled {
                     new_best_price: p(10)
                 }
             );
-            let expect_fills = &[f(1), fp(2, 1)];
+            let expect_fills = &[mm(1, 100, 10, 10), mt(2, 100, 10, 1)];
             assert_eq!(fills, expect_fills);
             assert_eq!(book.ask_volume(), v(19));
         }
         {
             let mut fills = Vec::new();
-            let res = book.execute_market_buy(v(9), &mut fills);
+            let res = book.execute_market_buy(o(101), v(9), &mut fills);
             assert_eq!(
                 res,
                 TxnOutcome::Filled {
                     new_best_price: p(10)
                 }
             );
-            let expect_fills = &[f(2)];
+            let expect_fills = &[mb(2, 101, 10, 9)];
             assert_eq!(fills, expect_fills);
         }
     }
@@ -694,37 +742,50 @@ mod tests {
     fn test_execute_market_sell_simple() {
         let mut ob = quick_book();
         {
-            let mut fills = Vec::new();
-            let res = ob.execute_market_sell(v(90), &mut fills);
+            let mut matches = Vec::new();
+            let res = ob.execute_market_sell(o(100), v(90), &mut matches);
             assert_eq!(res.filled(), p(10));
-            assert_eq!(fills, &[f(4), f(3), f(2), fp(1, 30)])
+            assert_eq!(
+                matches,
+                &[
+                    mm(4, 100, 25, 10),
+                    mm(3, 100, 20, 20),
+                    mm(2, 100, 15, 30),
+                    mt(1, 100, 10, 30)
+                ]
+            )
         }
         {
             let mut fills = Vec::new();
-            let res = ob.execute_market_sell(v(22), &mut fills);
+            let res = ob.execute_market_sell(o(101), v(22), &mut fills);
             assert_eq!(res.exhausted(), v(10));
-            assert_eq!(fills, &[f(1)])
+            assert_eq!(fills, &[mm(1, 101, 10, 10)])
         }
     }
 
     #[test]
     fn test_zero_volume_scenarios() {
         let mut book = OrderBook::new();
-        let mut fills = Vec::new();
+        let mut matches = Vec::new();
         {
             // TODO a zero-volume order should probably return success?
-            book.execute_market_buy(v(0), &mut fills).exhausted();
-            book.execute_market_sell(v(0), &mut fills).exhausted();
+            book.execute_market_buy(o(100), v(0), &mut matches)
+                .exhausted();
+            book.execute_market_sell(o(101), v(0), &mut matches)
+                .exhausted();
         }
         {
-            book.execute_market_buy(v(10), &mut fills).exhausted();
-            book.execute_market_sell(v(10), &mut fills).exhausted();
+            book.execute_market_buy(o(102), v(10), &mut matches)
+                .exhausted();
+            book.execute_market_sell(o(103), v(10), &mut matches)
+                .exhausted();
         }
         {
             book.add_ask(p(20), q(1, 10));
             book.add_bid(p(10), q(1, 10));
-            book.execute_market_buy(v(0), &mut fills).filled();
-            book.execute_market_sell(v(0), &mut fills).filled();
+            book.execute_market_buy(o(104), v(0), &mut matches).filled();
+            book.execute_market_sell(o(105), v(0), &mut matches)
+                .filled();
         }
     }
 
@@ -734,15 +795,15 @@ mod tests {
         let (tx_fill, rx_fill) = crossbeam_channel::bounded(1000);
         std::thread::spawn(move || run_orderbook_event_loop(rx_order, tx_fill));
 
-        tx_order.send(lb(1, 10, 30)).unwrap();
-        tx_order.send(lb(2, 10, 20)).unwrap();
-        tx_order.send(lb(3, 10, 10)).unwrap();
-        tx_order.send(mb(4, 20)).unwrap();
+        tx_order.send(lb(101, 10, 30)).unwrap();
+        tx_order.send(lb(102, 10, 20)).unwrap();
+        tx_order.send(lb(103, 10, 10)).unwrap();
+        tx_order.send(ob(104, 20)).unwrap();
 
-        let f1 = rx_fill.try_recv().unwrap();
+        let f1 = rx_fill.recv_timeout(Duration::from_secs(1)).unwrap();
         let f2 = rx_fill.try_recv().unwrap();
-        assert_eq!(f1, f(1));
-        assert_eq!(f2, fp(2, 10));
+        assert_eq!(f1, mm(1, 101, 1, 1));
+        assert_eq!(f2, mt(2, 101, 1, 10));
         assert!(rx_fill.try_recv().is_err());
     }
 
@@ -761,8 +822,8 @@ mod tests {
         ));
         assert_eq!(book.ask_volume(), v(90));
         let mut fills = Vec::new();
-        book.execute_market_buy(v(1), &mut fills).filled();
-        assert_eq!(fills, &[fp(6, 1)]);
+        book.execute_market_buy(o(100), v(1), &mut fills).filled();
+        assert_eq!(fills, &[mt(6, 100, 40, 1)]);
     }
 
     #[test]
@@ -791,10 +852,17 @@ mod tests {
     #[test]
     fn test_simple_limit_buy() {
         let mut book = quick_book();
-        let mut fills = Vec::new();
-        book.execute_limit_buy_order(o(100), p(38), v(50), &mut fills);
-        assert_eq!(fills, &[f(5)]);
-        assert_eq!(book.best_bid(), p(38));
-        assert_eq!(book.best_ask(), p(40));
+        {
+            let mut fills = Vec::new();
+            book.execute_limit_buy_order(o(100), p(38), v(50), &mut fills);
+            assert_eq!(fills, &[mm(5, 100, 35, 10)]);
+            assert_eq!(book.best_bid(), p(38));
+            assert_eq!(book.best_ask(), p(40));
+        }
+        {
+            let mut fills = Vec::new();
+            book.execute_limit_buy_order(o(101), p(40), v(1), &mut fills);
+            assert_eq!(fills, &[mt(6, 101, 40, 1)])
+        }
     }
 }
