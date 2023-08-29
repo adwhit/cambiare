@@ -12,8 +12,7 @@ pub fn orderbook_benchmark(c: &mut Criterion) {
             );
             let _ = book
                 .execute_market_buy(Volume::new(500), &mut fills)
-                .result()
-                .unwrap_err();
+                .exhausted();
             fills.clear()
         });
     });
@@ -28,8 +27,7 @@ pub fn orderbook_benchmark(c: &mut Criterion) {
             );
             let _ = book
                 .execute_market_sell(Volume::new(500), &mut fills)
-                .result()
-                .unwrap_err();
+                .exhausted();
             fills.clear()
         });
     });
@@ -67,8 +65,7 @@ pub fn orderbook_benchmark(c: &mut Criterion) {
 
             let _ = book
                 .execute_market_buy(Volume::new(500), &mut fills)
-                .result()
-                .unwrap();
+                .filled();
             // assert_eq!(fills.len(), 8);
             // assert_eq!(book.ask_volume(), Volume::new(50));
             fills.clear();

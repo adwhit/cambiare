@@ -211,30 +211,6 @@ impl OrderBook {
         }
     }
 
-    pub fn execute_market_buy(
-        &mut self,
-        target_vol: Volume,
-        fills: &mut Vec<Fill>,
-    ) -> MarketTxnOutcome {
-        let res = execute_market_txn(self.ask_levels_mut(), target_vol, fills);
-        if let MarketTxnOutcome::Success { new_best_price } = res {
-            self.best_ask = new_best_price
-        };
-        res
-    }
-
-    pub fn execute_market_sell(
-        &mut self,
-        target_vol: Volume,
-        fills: &mut Vec<Fill>,
-    ) -> MarketTxnOutcome {
-        let res = execute_market_txn(self.bid_levels_mut(), target_vol, fills);
-        if let MarketTxnOutcome::Success { new_best_price } = res {
-            self.best_bid = new_best_price
-        };
-        res
-    }
-
     fn cancel(&mut self, price: Price, order_id: OrderId) -> Cancellation {
         let Some(level) = self.levels.get_mut(&price) else {
             return Cancellation::NotFound;
@@ -250,6 +226,71 @@ impl OrderBook {
         }
         Cancellation::NotFound
     }
+
+    pub fn execute_market_buy(&mut self, target_vol: Volume, fills: &mut Vec<Fill>) -> TxnOutcome {
+        let res = execute_market_txn(
+            self.ask_levels_mut(),
+            target_vol,
+            TargetPrice::Market,
+            fills,
+        );
+        if let TxnOutcome::Filled { new_best_price } = res {
+            self.best_ask = new_best_price
+        };
+        res
+    }
+
+    pub fn execute_market_sell(&mut self, target_vol: Volume, fills: &mut Vec<Fill>) -> TxnOutcome {
+        let res = execute_market_txn(
+            self.bid_levels_mut(),
+            target_vol,
+            TargetPrice::Market,
+            fills,
+        );
+        if let TxnOutcome::Filled { new_best_price } = res {
+            self.best_bid = new_best_price
+        };
+        res
+    }
+
+    pub fn execute_limit_buy_order(
+        &mut self,
+        order_id: OrderId,
+        target_price: Price,
+        target_vol: Volume,
+        fills: &mut Vec<Fill>,
+    ) {
+        // may fill or partially fill
+        let res = execute_market_txn(
+            self.ask_levels_mut(),
+            target_vol,
+            TargetPrice::Buy(target_price),
+            fills,
+        );
+        match res {
+            TxnOutcome::Filled { new_best_price } => {
+                self.best_ask = new_best_price;
+            }
+            TxnOutcome::PartiallyFilled {
+                volume_transacted,
+                new_best_price,
+            } => {
+                self.best_ask = new_best_price;
+                self.add_bid(
+                    target_price,
+                    Quote::new(order_id, target_vol - volume_transacted),
+                )
+                .assert_placed();
+            }
+            TxnOutcome::MarketVolumeExhausted { volume_transacted } => {
+                self.add_bid(
+                    target_price,
+                    Quote::new(order_id, target_vol - volume_transacted),
+                )
+                .assert_placed();
+            }
+        }
+    }
 }
 
 enum Cancellation {
@@ -258,31 +299,88 @@ enum Cancellation {
 }
 
 #[derive(PartialEq, Eq, Debug)]
-pub enum MarketTxnOutcome {
-    Success { new_best_price: Price },
-    InsufficientVolume { volume_transacted: Volume },
+pub enum TxnOutcome {
+    Filled {
+        new_best_price: Price,
+    },
+    PartiallyFilled {
+        volume_transacted: Volume,
+        new_best_price: Price,
+    },
+    MarketVolumeExhausted {
+        volume_transacted: Volume,
+    },
 }
 
-impl MarketTxnOutcome {
-    pub fn result(self) -> Result<Price, Volume> {
-        match self {
-            MarketTxnOutcome::Success { new_best_price } => Ok(new_best_price),
-            MarketTxnOutcome::InsufficientVolume { volume_transacted } => Err(volume_transacted),
+impl TxnOutcome {
+    // test helper
+    pub fn filled(self) -> Price {
+        if let TxnOutcome::Filled { new_best_price } = self {
+            return new_best_price;
         }
+        panic!("expected Filled, got: {self:?}")
     }
+    // test helper
+    pub fn partial(self) -> (Price, Volume) {
+        if let TxnOutcome::PartiallyFilled {
+            new_best_price,
+            volume_transacted,
+        } = self
+        {
+            return (new_best_price, volume_transacted);
+        }
+        panic!("expected PartiallyFilled, got: {self:?}")
+    }
+    // test helper
+    pub fn exhausted(self) -> Volume {
+        if let TxnOutcome::MarketVolumeExhausted { volume_transacted } = self {
+            return volume_transacted;
+        }
+        panic!("expected MarketVolumeExhausted, got: {self:?}")
+    }
+}
+
+enum TargetPrice {
+    Buy(Price),
+    Sell(Price),
+    Market,
 }
 
 fn execute_market_txn<'a>(
     price_levels: impl Iterator<Item = (&'a Price, &'a mut Level)>,
     target_vol: Volume,
+    target_price: TargetPrice,
     fills: &mut Vec<Fill>,
-) -> MarketTxnOutcome {
+) -> TxnOutcome {
     let mut remaining_txn_vol = target_vol;
-    for (price, level) in price_levels {
+    for (&price, level) in price_levels {
+        match target_price {
+            TargetPrice::Buy(max_buy_price) => {
+                if max_buy_price < price {
+                    // we're done
+                    return TxnOutcome::PartiallyFilled {
+                        volume_transacted: target_vol - remaining_txn_vol,
+                        new_best_price: price,
+                    };
+                }
+            }
+            TargetPrice::Sell(min_sell_price) => {
+                if min_sell_price > price {
+                    // we're done
+                    return TxnOutcome::PartiallyFilled {
+                        volume_transacted: target_vol - remaining_txn_vol,
+                        new_best_price: price,
+                    };
+                }
+            }
+            TargetPrice::Market => {
+                // no problem
+            }
+        }
         if remaining_txn_vol == Volume::new(0) {
             // we're done
-            return MarketTxnOutcome::Success {
-                new_best_price: *price,
+            return TxnOutcome::Filled {
+                new_best_price: price,
             };
         } else if remaining_txn_vol >= level.total_volume {
             // will exhaust this level
@@ -321,13 +419,13 @@ fn execute_market_txn<'a>(
             level.tombstone_count += tombstone_inc;
             level.maybe_compact();
             // we're done
-            return MarketTxnOutcome::Success {
-                new_best_price: *price,
+            return TxnOutcome::Filled {
+                new_best_price: price,
             };
         }
     }
     // if we get here then we used up all the volume
-    MarketTxnOutcome::InsufficientVolume {
+    TxnOutcome::MarketVolumeExhausted {
         volume_transacted: target_vol - remaining_txn_vol,
     }
 }
@@ -337,6 +435,15 @@ pub enum Outcome {
     PlacedNew,
     PlacedNewBest,
     CrossedSpread,
+}
+
+impl Outcome {
+    fn assert_placed(self) {
+        match self {
+            Outcome::PlacedExisting | Outcome::PlacedNew | Outcome::PlacedNewBest => {}
+            Outcome::CrossedSpread => panic!("order was not placed"),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -383,10 +490,11 @@ pub fn run_orderbook_event_loop(rx_order: Receiver<Order>, tx_fill: Sender<Fill>
                 bid_balance,
             } => {
                 let fill = match book.execute_market_buy(volume, &mut fills_buffer) {
-                    MarketTxnOutcome::Success { .. } => Fill::new(order.id, FillCompletion::Full),
-                    MarketTxnOutcome::InsufficientVolume { volume_transacted } => {
+                    TxnOutcome::Filled { .. } => Fill::new(order.id, FillCompletion::Full),
+                    TxnOutcome::MarketVolumeExhausted { volume_transacted } => {
                         Fill::new(order.id, FillCompletion::Partial(volume_transacted))
                     }
+                    TxnOutcome::PartiallyFilled { .. } => unreachable!(),
                 };
                 fills_buffer.push(fill)
             }
@@ -395,10 +503,11 @@ pub fn run_orderbook_event_loop(rx_order: Receiver<Order>, tx_fill: Sender<Fill>
                 ask_balance,
             } => {
                 let fill = match book.execute_market_sell(volume, &mut fills_buffer) {
-                    MarketTxnOutcome::Success { .. } => Fill::new(order.id, FillCompletion::Full),
-                    MarketTxnOutcome::InsufficientVolume { volume_transacted } => {
+                    TxnOutcome::Filled { .. } => Fill::new(order.id, FillCompletion::Full),
+                    TxnOutcome::MarketVolumeExhausted { volume_transacted } => {
                         Fill::new(order.id, FillCompletion::Partial(volume_transacted))
                     }
+                    TxnOutcome::PartiallyFilled { .. } => unreachable!(),
                 };
                 fills_buffer.push(fill)
             }
@@ -518,37 +627,28 @@ mod tests {
 
         {
             let mut fills = Vec::new();
-            ob.execute_market_buy(v(1), &mut fills)
-                .result()
-                .expect("buy failed");
+            ob.execute_market_buy(v(1), &mut fills).filled();
             let expect_fills = &[fp(5, 1)];
             assert_eq!(fills, expect_fills);
             assert_eq!(ob.best_ask(), p(35));
         }
         {
             let mut fills = Vec::new();
-            ob.execute_market_buy(v(24), &mut fills)
-                .result()
-                .expect("buy failed");
+            ob.execute_market_buy(v(24), &mut fills).filled();
             let expect_fills = &[f(5), fp(6, 15)];
             assert_eq!(fills, expect_fills);
             assert_eq!(ob.best_ask(), p(40));
         }
         {
             let mut fills = Vec::new();
-            ob.execute_market_buy(v(5), &mut fills)
-                .result()
-                .expect("buy failed");
+            ob.execute_market_buy(v(5), &mut fills).filled();
             let expect_fills = &[f(6)];
             assert_eq!(fills, expect_fills);
             assert_eq!(ob.best_ask(), p(45));
         }
         {
             let mut fills = Vec::new();
-            let filled_vol = ob
-                .execute_market_buy(v(500), &mut fills)
-                .result()
-                .unwrap_err();
+            let filled_vol = ob.execute_market_buy(v(500), &mut fills).exhausted();
             assert_eq!(filled_vol, v(70));
             let expect_fills = &[f(7), f(8)];
             assert_eq!(fills, expect_fills);
@@ -568,7 +668,7 @@ mod tests {
             let res = book.execute_market_buy(v(11), &mut fills);
             assert_eq!(
                 res,
-                MarketTxnOutcome::Success {
+                TxnOutcome::Filled {
                     new_best_price: p(10)
                 }
             );
@@ -581,7 +681,7 @@ mod tests {
             let res = book.execute_market_buy(v(9), &mut fills);
             assert_eq!(
                 res,
-                MarketTxnOutcome::Success {
+                TxnOutcome::Filled {
                     new_best_price: p(10)
                 }
             );
@@ -596,13 +696,13 @@ mod tests {
         {
             let mut fills = Vec::new();
             let res = ob.execute_market_sell(v(90), &mut fills);
-            assert_eq!(res.result().unwrap(), p(10));
+            assert_eq!(res.filled(), p(10));
             assert_eq!(fills, &[f(4), f(3), f(2), fp(1, 30)])
         }
         {
             let mut fills = Vec::new();
             let res = ob.execute_market_sell(v(22), &mut fills);
-            assert_eq!(res.result().unwrap_err(), v(10));
+            assert_eq!(res.exhausted(), v(10));
             assert_eq!(fills, &[f(1)])
         }
     }
@@ -613,26 +713,18 @@ mod tests {
         let mut fills = Vec::new();
         {
             // TODO a zero-volume order should probably return success?
-            book.execute_market_buy(v(0), &mut fills)
-                .result()
-                .unwrap_err();
-            book.execute_market_sell(v(0), &mut fills)
-                .result()
-                .unwrap_err();
+            book.execute_market_buy(v(0), &mut fills).exhausted();
+            book.execute_market_sell(v(0), &mut fills).exhausted();
         }
         {
-            book.execute_market_buy(v(10), &mut fills)
-                .result()
-                .unwrap_err();
-            book.execute_market_sell(v(10), &mut fills)
-                .result()
-                .unwrap_err();
+            book.execute_market_buy(v(10), &mut fills).exhausted();
+            book.execute_market_sell(v(10), &mut fills).exhausted();
         }
         {
             book.add_ask(p(20), q(1, 10));
             book.add_bid(p(10), q(1, 10));
-            book.execute_market_buy(v(0), &mut fills).result().unwrap();
-            book.execute_market_sell(v(0), &mut fills).result().unwrap();
+            book.execute_market_buy(v(0), &mut fills).filled();
+            book.execute_market_sell(v(0), &mut fills).filled();
         }
     }
 
@@ -669,7 +761,7 @@ mod tests {
         ));
         assert_eq!(book.ask_volume(), v(90));
         let mut fills = Vec::new();
-        book.execute_market_buy(v(1), &mut fills).result().unwrap();
+        book.execute_market_buy(v(1), &mut fills).filled();
         assert_eq!(fills, &[fp(6, 1)]);
     }
 
@@ -694,5 +786,15 @@ mod tests {
             assert_eq!(level.quotes.len(), 0);
             assert_eq!(level.tombstone_count, 0);
         }
+    }
+
+    #[test]
+    fn test_simple_limit_buy() {
+        let mut book = quick_book();
+        let mut fills = Vec::new();
+        book.execute_limit_buy_order(o(100), p(38), v(50), &mut fills);
+        assert_eq!(fills, &[f(5)]);
+        assert_eq!(book.best_bid(), p(38));
+        assert_eq!(book.best_ask(), p(40));
     }
 }
