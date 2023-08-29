@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crossbeam_channel::{Receiver, Sender};
 
-use order_book::{Match, Order};
+use order_book::{Match, MatchType, Order};
 
 pub use order_book::run_orderbook_event_loop;
 pub use order_book::{OrderBook, Quote};
@@ -82,12 +82,12 @@ struct Symbol {
 #[derive(Default)]
 struct Accounts {
     accounts: HashMap<UserId, UserAccount>,
-    orders: HashMap<OrderId, (UserId, AccountOrder)>,
+    live_orders: HashMap<OrderId, (UserId, AccountOrder)>,
 }
 
 #[derive(Default)]
 struct UserAccount {
-    orders: Vec<OrderId>,
+    live_orders: Vec<OrderId>,
     balances: HashMap<Currency, Balance>,
 }
 
@@ -117,6 +117,25 @@ enum AccountOrderType {
     LimitSell { volume: Volume, price: Price },
 }
 
+#[derive(PartialEq)]
+enum Side {
+    Buy,
+    Sell,
+}
+
+impl AccountOrderType {
+    fn side(&self) -> Side {
+        match self {
+            AccountOrderType::MarketBuy { .. }
+            | AccountOrderType::MarketBuyQ { .. }
+            | AccountOrderType::LimitBuy { .. } => Side::Buy,
+            AccountOrderType::MarketSell { .. }
+            | AccountOrderType::MarketSellQ { .. }
+            | AccountOrderType::LimitSell { .. } => Side::Sell,
+        }
+    }
+}
+
 pub struct AccountOrder {
     id: OrderId,
     symbol: Symbol,
@@ -130,72 +149,116 @@ pub fn run_account_event_loop(
     tx_outcome: Sender<String>,
 ) {
     let mut accounts = Accounts::default();
-    for ev in rx_acct_event {
-        match ev.event {
-            AccountEventType::Deposit { currency, balance } => {
-                let entry = accounts.accounts.entry(ev.user_id).or_default();
-                let bal = entry.balances.entry(currency).or_default();
-                *bal += balance;
+    crossbeam_channel::select! {
+        recv(rx_acct_event) -> msg => {
+            handle_account_event(msg.unwrap(), &mut accounts, &tx_order, &tx_outcome)
+        }
+        recv(rx_matches) -> msg => {
+            handle_matched_trade(msg.unwrap(), &mut accounts)
+        }
+    }
+}
+
+fn handle_matched_trade(match_ev: Match, accounts: &mut Accounts) {
+    let Some((maker_user_id, maker_acct_order)) =
+        accounts.live_orders.get(&match_ev.maker_order_id)
+    else {
+        todo!()
+    };
+    let Some((taker_user_id, taker_acct_order)) =
+        accounts.live_orders.get(&match_ev.taker_order_id)
+    else {
+        todo!()
+    };
+    let Some(maker_acct) = accounts.accounts.get_mut(&maker_user_id) else {
+        todo!()
+    };
+    let Some(taker_acct) = accounts.accounts.get_mut(&taker_user_id) else {
+        todo!()
+    };
+
+    let maker_side = maker_acct_order.typ.side();
+    let taker_side = taker_acct_order.typ.side();
+    assert!(maker_side != taker_side);
+    match match_ev.typ {
+        MatchType::MakerFilled => {
+            todo!()
+        }
+        MatchType::TakerFilled => todo!(),
+        MatchType::BothFilled => todo!(),
+    }
+}
+
+fn handle_account_event(
+    ev: AccountEvent,
+    accounts: &mut Accounts,
+    tx_order: &Sender<Order>,
+    tx_outcome: &Sender<String>,
+) {
+    match ev.event {
+        AccountEventType::Deposit { currency, balance } => {
+            let entry = accounts.accounts.entry(ev.user_id).or_default();
+            let bal = entry.balances.entry(currency).or_default();
+            *bal += balance;
+        }
+        AccountEventType::Withdraw { currency, balance } => {
+            let Some(acct) = accounts.accounts.get_mut(&ev.user_id) else {
+                tx_outcome.send("insufficient balance".into()).unwrap();
+                return;
+            };
+            let Some(bal) = acct.balances.get_mut(&currency) else {
+                tx_outcome.send("insufficient balance".into()).unwrap();
+                return;
+            };
+            if *bal < balance {
+                tx_outcome.send("insufficient balance".into()).unwrap();
+                return;
             }
-            AccountEventType::Withdraw { currency, balance } => {
+            *bal += balance;
+            tx_outcome.send("balance withdrawn".into()).unwrap();
+        }
+        AccountEventType::PlaceOrder(acct_order) => match acct_order.typ {
+            AccountOrderType::MarketBuy { base_qty } => {
                 let Some(acct) = accounts.accounts.get_mut(&ev.user_id) else {
                     tx_outcome.send("insufficient balance".into()).unwrap();
-                    continue;
+                    return;
                 };
-                let Some(bal) = acct.balances.get_mut(&currency) else {
+                let Some(quote_bal) = acct.balances.get_mut(&acct_order.symbol.quote) else {
                     tx_outcome.send("insufficient balance".into()).unwrap();
-                    continue;
+                    return;
                 };
-                if *bal < balance {
-                    tx_outcome.send("insufficient balance".into()).unwrap();
-                    continue;
-                }
-                *bal += balance;
-                tx_outcome.send("balance withdrawn".into()).unwrap();
+                todo!()
             }
-            AccountEventType::PlaceOrder(acct_order) => match acct_order.typ {
-                AccountOrderType::MarketBuy { base_qty } => {
-                    let Some(acct) = accounts.accounts.get_mut(&ev.user_id) else {
-                        tx_outcome.send("insufficient balance".into()).unwrap();
-                        continue;
-                    };
-                    let Some(quote_bal) = acct.balances.get_mut(&acct_order.symbol.quote) else {
-                        tx_outcome.send("insufficient balance".into()).unwrap();
-                        continue;
-                    };
-                    todo!()
+            AccountOrderType::MarketSell { base_qty } => {
+                let Some(acct) = accounts.accounts.get_mut(&ev.user_id) else {
+                    tx_outcome.send("insufficient balance".into()).unwrap();
+                    return;
+                };
+                let Some(base_bal) = acct.balances.get_mut(&acct_order.symbol.base) else {
+                    tx_outcome.send("insufficient balance".into()).unwrap();
+                    return;
+                };
+                // this is the easiest order type - just check we have enough of
+                // the thing we want to sell
+                if base_bal.inner() < base_qty.into() {
+                    tx_outcome.send("insufficient balance".into()).unwrap();
+                    return;
                 }
-                AccountOrderType::MarketSell { base_qty } => {
-                    let Some(acct) = accounts.accounts.get_mut(&ev.user_id) else {
-                        tx_outcome.send("insufficient balance".into()).unwrap();
-                        continue;
-                    };
-                    let Some(base_bal) = acct.balances.get_mut(&acct_order.symbol.base) else {
-                        tx_outcome.send("insufficient balance".into()).unwrap();
-                        continue;
-                    };
-                    // this is the easiest order type - just check we have enough of
-                    // the thing we want to sell
-                    if base_bal.inner() < base_qty.into() {
-                        tx_outcome.send("insufficient balance".into()).unwrap();
-                        continue;
-                    }
-                    *base_bal -= Balance::from(base_qty.inner());
-                    acct.orders.push(acct_order.id);
-                    let order = Order {
-                        id: acct_order.id,
-                        typ: order_book::OrderType::MarketSell { base_qty },
-                    };
-                    accounts
-                        .orders
-                        .insert(acct_order.id, (ev.user_id, acct_order));
-                    tx_order.send(order);
-                }
-                AccountOrderType::LimitBuy { volume, price } => todo!(),
-                AccountOrderType::LimitSell { volume, price } => todo!(),
-                AccountOrderType::MarketBuyQ { quote_qty } => {}
-                AccountOrderType::MarketSellQ { quote_qty } => todo!(),
-            },
-        }
+                *base_bal -= Balance::from(base_qty.inner());
+                acct.live_orders.push(acct_order.id);
+                let order = Order {
+                    id: acct_order.id,
+                    typ: order_book::OrderType::MarketSell { base_qty },
+                };
+                accounts
+                    .live_orders
+                    .insert(acct_order.id, (ev.user_id, acct_order));
+                tx_order.send(order);
+            }
+            AccountOrderType::LimitBuy { volume, price } => todo!(),
+            AccountOrderType::LimitSell { volume, price } => todo!(),
+            AccountOrderType::MarketBuyQ { quote_qty } => {}
+            AccountOrderType::MarketSellQ { quote_qty } => todo!(),
+        },
     }
 }

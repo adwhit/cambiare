@@ -86,11 +86,11 @@ pub enum MatchType {
 
 #[derive(Copy, Clone, PartialEq, Eq, derive_more::Constructor)]
 pub struct Match {
-    maker_order_id: OrderId,
-    taker_order_id: OrderId,
-    price: Price,
-    volume: Volume,
-    typ: MatchType,
+    pub maker_order_id: OrderId,
+    pub taker_order_id: OrderId,
+    pub price: Price,
+    pub volume: Volume,
+    pub typ: MatchType,
 }
 
 impl std::fmt::Debug for Match {
