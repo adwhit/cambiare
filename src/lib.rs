@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crossbeam_channel::{Receiver, Sender};
 
-use order_book::Order;
+use order_book::{Match, Order};
 
 pub use order_book::run_orderbook_event_loop;
 pub use order_book::{OrderBook, Quote};
@@ -34,6 +34,21 @@ mod newtypes {
                     write!(f, "{}", self.0)
                 }
             }
+            impl From<u64> for $newtype {
+                fn from(other: u64) -> Self {
+                    Self(other)
+                }
+            }
+            impl From<$newtype> for u64 {
+                fn from(other: $newtype) -> Self {
+                    other.0
+                }
+            }
+            impl $newtype {
+                pub fn inner(self) -> u64 {
+                    self.0
+                }
+            }
         };
     }
     newtype!(Price);
@@ -60,14 +75,14 @@ pub use newtypes::{Balance, OrderId, Price, UserId, Volume};
 pub struct Currency(&'static str);
 
 struct Symbol {
-    bid: Currency,
-    ask: Currency,
+    base: Currency,
+    quote: Currency,
 }
 
 #[derive(Default)]
 struct Accounts {
     accounts: HashMap<UserId, UserAccount>,
-    orders: HashMap<OrderId, UserId>,
+    orders: HashMap<OrderId, (UserId, AccountOrder)>,
 }
 
 #[derive(Default)]
@@ -90,16 +105,27 @@ pub enum AccountEventType {
         currency: Currency,
         balance: Balance,
     },
-    PlaceOrder(Order),
+    PlaceOrder(AccountOrder),
 }
 
-struct AccountOrder {
-    user_id: UserId,
-    order: Order,
+enum AccountOrderType {
+    MarketBuy { base_qty: Volume },
+    MarketSell { base_qty: Volume },
+    MarketBuyQ { quote_qty: Volume },
+    MarketSellQ { quote_qty: Volume },
+    LimitBuy { volume: Volume, price: Price },
+    LimitSell { volume: Volume, price: Price },
+}
+
+pub struct AccountOrder {
+    id: OrderId,
+    symbol: Symbol,
+    typ: AccountOrderType,
 }
 
 pub fn run_account_event_loop(
     rx_acct_event: Receiver<AccountEvent>,
+    rx_matches: Receiver<Match>,
     tx_order: Sender<Order>,
     tx_outcome: Sender<String>,
 ) {
@@ -127,9 +153,49 @@ pub fn run_account_event_loop(
                 *bal += balance;
                 tx_outcome.send("balance withdrawn".into()).unwrap();
             }
-            AccountEventType::PlaceOrder(_) => {
-                todo!()
-            }
+            AccountEventType::PlaceOrder(acct_order) => match acct_order.typ {
+                AccountOrderType::MarketBuy { base_qty } => {
+                    let Some(acct) = accounts.accounts.get_mut(&ev.user_id) else {
+                        tx_outcome.send("insufficient balance".into()).unwrap();
+                        continue;
+                    };
+                    let Some(quote_bal) = acct.balances.get_mut(&acct_order.symbol.quote) else {
+                        tx_outcome.send("insufficient balance".into()).unwrap();
+                        continue;
+                    };
+                    todo!()
+                }
+                AccountOrderType::MarketSell { base_qty } => {
+                    let Some(acct) = accounts.accounts.get_mut(&ev.user_id) else {
+                        tx_outcome.send("insufficient balance".into()).unwrap();
+                        continue;
+                    };
+                    let Some(base_bal) = acct.balances.get_mut(&acct_order.symbol.base) else {
+                        tx_outcome.send("insufficient balance".into()).unwrap();
+                        continue;
+                    };
+                    // this is the easiest order type - just check we have enough of
+                    // the thing we want to sell
+                    if base_bal.inner() < base_qty.into() {
+                        tx_outcome.send("insufficient balance".into()).unwrap();
+                        continue;
+                    }
+                    *base_bal -= Balance::from(base_qty.inner());
+                    acct.orders.push(acct_order.id);
+                    let order = Order {
+                        id: acct_order.id,
+                        typ: order_book::OrderType::MarketSell { base_qty },
+                    };
+                    accounts
+                        .orders
+                        .insert(acct_order.id, (ev.user_id, acct_order));
+                    tx_order.send(order);
+                }
+                AccountOrderType::LimitBuy { volume, price } => todo!(),
+                AccountOrderType::LimitSell { volume, price } => todo!(),
+                AccountOrderType::MarketBuyQ { quote_qty } => {}
+                AccountOrderType::MarketSellQ { quote_qty } => todo!(),
+            },
         }
     }
 }
