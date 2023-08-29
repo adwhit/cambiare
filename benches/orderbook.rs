@@ -11,7 +11,7 @@ pub fn orderbook_benchmark(c: &mut Criterion) {
                 Quote::new(OrderId::new(1), Volume::new(50)),
             );
             let _ = book
-                .execute_market_buy(Volume::new(500), &mut fills)
+                .execute_market_buy(OrderId::new(2), Volume::new(500), &mut fills)
                 .exhausted();
             fills.clear()
         });
@@ -26,7 +26,7 @@ pub fn orderbook_benchmark(c: &mut Criterion) {
                 Quote::new(OrderId::new(1), Volume::new(50)),
             );
             let _ = book
-                .execute_market_sell(Volume::new(500), &mut fills)
+                .execute_market_sell(OrderId::new(2), Volume::new(500), &mut fills)
                 .exhausted();
             fills.clear()
         });
@@ -64,7 +64,7 @@ pub fn orderbook_benchmark(c: &mut Criterion) {
             }
 
             let _ = book
-                .execute_market_buy(Volume::new(500), &mut fills)
+                .execute_market_buy(OrderId::new(100), Volume::new(500), &mut fills)
                 .filled();
             // assert_eq!(fills.len(), 8);
             // assert_eq!(book.ask_volume(), Volume::new(50));

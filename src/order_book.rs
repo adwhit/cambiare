@@ -261,6 +261,8 @@ impl OrderBook {
         );
         if let TxnOutcome::Filled { new_best_price } = res {
             self.best_ask = new_best_price
+        } else {
+            self.best_ask = Price::new(u64::MAX);
         };
         res
     }
@@ -280,6 +282,8 @@ impl OrderBook {
         );
         if let TxnOutcome::Filled { new_best_price } = res {
             self.best_bid = new_best_price
+        } else {
+            self.best_bid = Price::new(u64::MIN);
         };
         res
     }
@@ -315,7 +319,48 @@ impl OrderBook {
                 .assert_placed();
             }
             TxnOutcome::MarketVolumeExhausted { volume_transacted } => {
+                self.best_ask = Price::new(u64::MAX);
                 self.add_bid(
+                    target_price,
+                    Quote::new(order_id, target_vol - volume_transacted),
+                )
+                .assert_placed();
+            }
+        }
+    }
+    pub fn execute_limit_sell_order(
+        &mut self,
+        order_id: OrderId,
+        target_price: Price,
+        target_vol: Volume,
+        fills: &mut Vec<Match>,
+    ) {
+        // may fill or partially fill
+        let res = execute_market_txn(
+            self.bid_levels_mut(),
+            order_id,
+            target_vol,
+            OrderTarget::LimitSell(target_price),
+            fills,
+        );
+        match res {
+            TxnOutcome::Filled { new_best_price } => {
+                self.best_bid = new_best_price;
+            }
+            TxnOutcome::PartiallyFilled {
+                volume_transacted,
+                new_best_price,
+            } => {
+                self.best_bid = new_best_price;
+                self.add_ask(
+                    target_price,
+                    Quote::new(order_id, target_vol - volume_transacted),
+                )
+                .assert_placed();
+            }
+            TxnOutcome::MarketVolumeExhausted { volume_transacted } => {
+                self.best_bid = Price::new(u64::MIN);
+                self.add_ask(
                     target_price,
                     Quote::new(order_id, target_vol - volume_transacted),
                 )
@@ -388,6 +433,7 @@ fn execute_market_txn<'a>(
 ) -> TxnOutcome {
     let mut remaining_txn_vol = target_vol;
     for (&price, level) in price_levels {
+        println!("price {price}");
         match target_price {
             OrderTarget::LimitBuy(max_buy_price) => {
                 if max_buy_price < price {
@@ -501,12 +547,6 @@ impl Outcome {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum FillCompletion {
-    Full,
-    Partial(Volume),
-}
-
 pub enum OrderType {
     MarketBuy {
         volume: Volume,
@@ -535,25 +575,29 @@ pub struct Order {
     typ: OrderType,
 }
 
-pub fn run_orderbook_event_loop(rx_order: Receiver<Order>, tx_fill: Sender<Match>) {
+pub fn run_orderbook_event_loop(rx_order: Receiver<Order>, tx_match: Sender<Match>) {
     let mut book = OrderBook::new();
-    let mut fills_buffer = Vec::with_capacity(1000);
+    let mut matches_buffer = Vec::with_capacity(1000);
     for order in rx_order {
         match order.typ {
             OrderType::MarketBuy {
                 volume,
                 bid_balance,
             } => {
-                book.execute_market_buy(order.id, volume, &mut fills_buffer);
+                book.execute_market_buy(order.id, volume, &mut matches_buffer);
             }
             OrderType::MarketSell {
                 volume,
                 ask_balance,
             } => {
-                book.execute_market_sell(order.id, volume, &mut fills_buffer);
+                book.execute_market_sell(order.id, volume, &mut matches_buffer);
             }
-            OrderType::LimitBuy { .. } => todo!(),
-            OrderType::LimitSell { .. } => todo!(),
+            OrderType::LimitBuy { price, volume } => {
+                book.execute_limit_buy_order(order.id, price, volume, &mut matches_buffer)
+            }
+            OrderType::LimitSell { price, volume } => {
+                book.execute_limit_sell_order(order.id, price, volume, &mut matches_buffer)
+            }
             OrderType::Cancel { price, order_id } => {
                 match book.cancel(price, order_id) {
                     Cancellation::WasCancelled => {}
@@ -562,10 +606,10 @@ pub fn run_orderbook_event_loop(rx_order: Receiver<Order>, tx_fill: Sender<Match
                 continue;
             }
         }
-        for &fill in fills_buffer.iter() {
-            tx_fill.send(fill).expect("tx_fill send failed");
+        for &fill in matches_buffer.iter() {
+            tx_match.send(fill).expect("tx_fill send failed");
         }
-        fills_buffer.clear();
+        matches_buffer.clear();
     }
 }
 
@@ -601,7 +645,7 @@ mod tests {
             volume: Volume::new(v),
         }
     }
-    fn lb(id: u64, price: u64, vol: u64) -> Order {
+    fn olb(id: u64, price: u64, vol: u64) -> Order {
         Order {
             id: o(id),
             typ: OrderType::LimitBuy {
@@ -610,12 +654,30 @@ mod tests {
             },
         }
     }
-    fn ob(id: u64, vol: u64) -> Order {
+    fn ols(id: u64, price: u64, vol: u64) -> Order {
+        Order {
+            id: o(id),
+            typ: OrderType::LimitSell {
+                price: p(price),
+                volume: v(vol),
+            },
+        }
+    }
+    fn omb(id: u64, vol: u64) -> Order {
         Order {
             id: o(id),
             typ: OrderType::MarketBuy {
                 volume: v(vol),
                 bid_balance: b(10000),
+            },
+        }
+    }
+    fn oms(id: u64, vol: u64) -> Order {
+        Order {
+            id: o(id),
+            typ: OrderType::MarketSell {
+                volume: v(vol),
+                ask_balance: b(10000),
             },
         }
     }
@@ -700,7 +762,7 @@ mod tests {
             assert_eq!(filled_vol, v(70));
             let expect_fills = &[mm(7, 103, 45, 30), mm(8, 103, 50, 40)];
             assert_eq!(matches, expect_fills);
-            assert_eq!(ob.best_ask(), p(45));
+            assert_eq!(ob.best_ask(), p(u64::MAX));
         }
     }
 
@@ -792,19 +854,42 @@ mod tests {
     #[test]
     fn test_run_order_book() {
         let (tx_order, rx_order) = crossbeam_channel::bounded(1000);
-        let (tx_fill, rx_fill) = crossbeam_channel::bounded(1000);
-        std::thread::spawn(move || run_orderbook_event_loop(rx_order, tx_fill));
+        let (tx_match, rx_match) = crossbeam_channel::bounded(1000);
+        std::thread::spawn(move || run_orderbook_event_loop(rx_order, tx_match));
 
-        tx_order.send(lb(101, 10, 30)).unwrap();
-        tx_order.send(lb(102, 10, 20)).unwrap();
-        tx_order.send(lb(103, 10, 10)).unwrap();
-        tx_order.send(ob(104, 20)).unwrap();
+        // add three limit orders
+        tx_order.send(olb(101, 10, 10)).unwrap();
+        tx_order.send(olb(102, 9, 20)).unwrap();
+        tx_order.send(olb(103, 8, 30)).unwrap();
+        {
+            // market sell
+            tx_order.send(oms(104, 31)).unwrap();
 
-        let f1 = rx_fill.recv_timeout(Duration::from_secs(1)).unwrap();
-        let f2 = rx_fill.try_recv().unwrap();
-        assert_eq!(f1, mm(1, 101, 1, 1));
-        assert_eq!(f2, mt(2, 101, 1, 10));
-        assert!(rx_fill.try_recv().is_err());
+            let f1 = rx_match.recv_timeout(Duration::from_secs(1)).unwrap();
+            let f2 = rx_match.try_recv().unwrap();
+            let f3 = rx_match.try_recv().unwrap();
+            assert_eq!(f1, mm(101, 104, 10, 10));
+            assert_eq!(f2, mm(102, 104, 9, 20));
+            assert_eq!(f3, mt(103, 104, 8, 1));
+            assert!(rx_match.try_recv().is_err());
+        }
+
+        {
+            // limit sell
+            tx_order.send(ols(201, 5, 100)).unwrap();
+            let f1 = rx_match.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(f1, mm(103, 201, 8, 29));
+            assert!(rx_match.try_recv().is_err());
+        }
+
+        {
+            // market buy
+            tx_order.send(omb(301, 200)).unwrap();
+
+            let f1 = rx_match.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(f1, mm(201, 301, 5, 71));
+            assert!(rx_match.try_recv().is_err());
+        }
     }
 
     #[test]
@@ -863,6 +948,23 @@ mod tests {
             let mut fills = Vec::new();
             book.execute_limit_buy_order(o(101), p(40), v(1), &mut fills);
             assert_eq!(fills, &[mt(6, 101, 40, 1)])
+        }
+    }
+
+    #[test]
+    fn test_simple_limit_sell() {
+        let mut book = quick_book();
+        {
+            let mut fills = Vec::new();
+            book.execute_limit_sell_order(o(100), p(22), v(50), &mut fills);
+            assert_eq!(fills, &[mm(4, 100, 25, 10)]);
+            assert_eq!(book.best_bid(), p(20));
+            assert_eq!(book.best_ask(), p(22));
+        }
+        {
+            let mut fills = Vec::new();
+            book.execute_limit_sell_order(o(101), p(20), v(1), &mut fills);
+            assert_eq!(fills, &[mt(3, 101, 20, 1)])
         }
     }
 }
