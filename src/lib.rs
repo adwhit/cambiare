@@ -8,6 +8,7 @@ pub use order_book::run_orderbook_event_loop;
 pub use order_book::{OrderBook, Quote};
 
 mod order_book;
+pub mod server;
 
 mod newtypes {
     macro_rules! newtype {

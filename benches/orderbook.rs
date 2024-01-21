@@ -2,7 +2,7 @@ use cambiare::{Balance, OrderBook, OrderId, Price, Quote, Volume};
 use criterion::{criterion_group, criterion_main, Criterion};
 
 pub fn orderbook_benchmark(c: &mut Criterion) {
-    c.bench_function("simple-market-buy", |b| {
+    c.bench_function("add ask then execute market buy", |b| {
         let mut book = OrderBook::new();
         let mut fills = Vec::new();
         b.iter(|| {
@@ -22,7 +22,7 @@ pub fn orderbook_benchmark(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("simple-market-sell", |b| {
+    c.bench_function("add bid then execute market sell", |b| {
         let mut book = OrderBook::new();
         let mut fills = Vec::new();
         b.iter(|| {
@@ -37,7 +37,7 @@ pub fn orderbook_benchmark(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("add-500-volume-and-execute-market-buy", |b| {
+    c.bench_function("add 500 volume then execute market buy", |b| {
         let mut book = OrderBook::new();
         book.add_ask(
             Price::new(500),
