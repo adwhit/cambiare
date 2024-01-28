@@ -1016,6 +1016,7 @@ mod tests {
         {
             // market sell
             tx_order.send(oms(104, 31)).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
 
             let f1 = rx_match.recv_timeout(Duration::from_secs(1)).unwrap();
             let f2 = rx_match.try_recv().unwrap();
@@ -1029,6 +1030,8 @@ mod tests {
         {
             // limit sell
             tx_order.send(ols(201, 5, 100)).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+
             let f1 = rx_match.recv_timeout(Duration::from_secs(1)).unwrap();
             assert_eq!(f1, mm(103, 201, 8, 29));
             assert!(rx_match.try_recv().is_err());
@@ -1037,6 +1040,7 @@ mod tests {
         {
             // market buy
             tx_order.send(omb(301, 200)).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
 
             let f1 = rx_match.recv_timeout(Duration::from_secs(1)).unwrap();
             assert_eq!(f1, mm(201, 301, 5, 71));
