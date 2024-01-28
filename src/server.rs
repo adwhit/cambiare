@@ -1,7 +1,12 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use axum::{extract::State, routing::get, Json, Router};
-use crossbeam_channel::Sender;
+use crate::order_book;
+use axum::{
+    extract::{Path, State},
+    routing::get,
+    Json, Router,
+};
+use crossbeam_channel::{Receiver, Sender};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +23,7 @@ fn init_markets() -> BTreeMap<TradingPair, MarketState> {
     use Currency::*;
     [TradingPair::new(USD, GBP)]
         .into_iter()
-        .map(|t| (t, MarketState::default()))
+        .map(|t| (t, start_market_in_thread()))
         .collect()
 }
 
@@ -35,7 +40,9 @@ struct AppState {
     markets: BTreeMap<TradingPair, MarketState>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord, derive_more::FromStr,
+)]
 enum Currency {
     EUR,
     GBP,
@@ -60,18 +67,54 @@ struct TradingPair {
     ask: Currency,
 }
 
+#[derive(Debug)]
+struct BadTradingPairError;
+
+impl std::str::FromStr for TradingPair {
+    type Err = BadTradingPairError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let Some((l, r)) = s.split_once("_") else {
+            return Err(BadTradingPairError);
+        };
+        let Ok(l) = l.parse() else {
+            return Err(BadTradingPairError);
+        };
+        let Ok(r) = r.parse() else {
+            return Err(BadTradingPairError);
+        };
+        Ok(TradingPair::new(l, r))
+    }
+}
+
+struct MarketSnapshot {
+    book: order_book::OrderBook,
+}
+
 struct MarketState {
     volume_24h: f64,
-    query_tx: Sender<MarketQuery>,
-    query_rx: Sender<MarketQueryResponse>,
+    latest_snapshot: MarketSnapshot,
+    order_tx: Sender<order_book::Order>,
+    snapshot_rx: Receiver<order_book::OrderBook>,
 }
 
-enum MarketQuery {
-    Orderbook,
-}
+fn start_market_in_thread() -> MarketState {
+    let (order_tx, order_rx) = crossbeam_channel::unbounded();
+    let (match_tx, match_rx) = crossbeam_channel::unbounded();
+    let (snapshot_tx, snapshot_rx) = crossbeam_channel::unbounded();
 
-enum MarketQueryResponse {
-    Orderbook(Orderbook),
+    std::thread::spawn(move || {
+        order_book::run_orderbook_event_loop(order_rx, match_tx, snapshot_tx);
+    });
+
+    MarketState {
+        volume_24h: 0.0,
+        latest_snapshot: MarketSnapshot {
+            book: order_book::OrderBook::default(),
+        },
+        order_tx,
+        snapshot_rx,
+    }
 }
 
 async fn get_markets(state: State<Arc<AppState>>) -> Json<Vec<TradingPair>> {
@@ -80,15 +123,25 @@ async fn get_markets(state: State<Arc<AppState>>) -> Json<Vec<TradingPair>> {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 // Only fo de/serialization - do not mix up with types in order_book.rs
-struct Orderbook {
+struct ApiOrderbook {
     bid: BTreeMap<Decimal, Decimal>,
     ask: BTreeMap<Decimal, Decimal>,
 }
 
+impl ApiOrderbook {
+    fn from_order_book(book: &order_book::OrderBook) -> Self {
+        todo!()
+    }
+}
+
 async fn get_market_orderbook(
     state: State<Arc<AppState>>,
-) -> Json<BTreeMap<TradingPair, Orderbook>> {
-    todo!()
+    path: Path<String>,
+) -> Json<ApiOrderbook> {
+    let pair: TradingPair = path.as_str().parse().unwrap();
+    let market = state.markets.get(&pair).unwrap();
+    let book = ApiOrderbook::from_order_book(&market.latest_snapshot.book);
+    Json(book)
 }
 
 #[cfg(test)]

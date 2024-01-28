@@ -129,7 +129,7 @@ impl OrderBook {
         }
     }
 
-    fn ask_levels(&self) -> impl Iterator<Item = (&Price, &Level)> {
+    pub(crate) fn ask_levels(&self) -> impl Iterator<Item = (&Price, &Level)> {
         self.levels.range(self.best_ask..)
     }
 
@@ -137,7 +137,7 @@ impl OrderBook {
         self.levels.range_mut(self.best_ask..)
     }
 
-    fn bid_levels(&self) -> impl Iterator<Item = (&Price, &Level)> {
+    pub(crate) fn bid_levels(&self) -> impl Iterator<Item = (&Price, &Level)> {
         self.levels.range(..=self.best_bid).rev()
     }
 
@@ -619,10 +619,14 @@ pub struct Order {
     pub typ: OrderType,
 }
 
-pub fn run_orderbook_event_loop(rx_order: Receiver<Order>, tx_match: Sender<Match>) {
+pub fn run_orderbook_event_loop(
+    order_rx: Receiver<Order>,
+    match_tx: Sender<Match>,
+    snapshot_tx: Sender<OrderBook>,
+) {
     let mut book = OrderBook::new();
     let mut matches_buffer = Vec::with_capacity(1000);
-    for order in rx_order {
+    for order in order_rx {
         match order.typ {
             OrderType::MarketBuy {
                 target_base_qty,
@@ -661,7 +665,7 @@ pub fn run_orderbook_event_loop(rx_order: Receiver<Order>, tx_match: Sender<Matc
             }
         }
         for &fill in matches_buffer.iter() {
-            tx_match.send(fill).expect("tx_fill send failed");
+            match_tx.send(fill).expect("tx_fill send failed");
         }
         matches_buffer.clear();
     }
@@ -1007,7 +1011,8 @@ mod tests {
     fn test_run_order_book() {
         let (tx_order, rx_order) = crossbeam_channel::bounded(1000);
         let (tx_match, rx_match) = crossbeam_channel::bounded(1000);
-        std::thread::spawn(move || run_orderbook_event_loop(rx_order, tx_match));
+        let (tx_snapshot, _rx_snapshot) = crossbeam_channel::bounded(1000);
+        std::thread::spawn(move || run_orderbook_event_loop(rx_order, tx_match, tx_snapshot));
 
         // add three limit orders
         tx_order.send(olb(101, 10, 10)).unwrap();
