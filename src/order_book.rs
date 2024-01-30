@@ -8,13 +8,16 @@ const LEVEL_QUOTE_INIT_CAPACITY: usize = 128;
 const TOMBSTONE_GC_LIMIT: u32 = 1000;
 
 #[derive(Clone, Debug)]
-struct Level {
+pub(crate) struct Level {
     total_volume: Volume,
     quotes: Vec<Quote>,
     tombstone_count: u32,
 }
 
 impl Level {
+    pub(crate) fn total_volume(&self) -> Volume {
+        self.total_volume
+    }
     fn iter_quotes(&self) -> impl Iterator<Item = &Quote> {
         self.quotes.iter().filter(|q| !q.is_tombstone())
     }

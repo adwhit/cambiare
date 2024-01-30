@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
 };
 use crossbeam_channel::{Receiver, Sender};
-use rust_decimal::Decimal;
+use rust_decimal::{prelude::FromPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
 
 use crate::{Price, Volume};
@@ -19,7 +19,7 @@ fn app(state: AppState) -> Router {
         .with_state(Arc::new(state))
 }
 
-fn init_markets() -> BTreeMap<TradingPair, MarketState> {
+fn init_new_markets() -> BTreeMap<TradingPair, MarketState> {
     use Currency::*;
     [TradingPair::new(USD, GBP)]
         .into_iter()
@@ -29,7 +29,7 @@ fn init_markets() -> BTreeMap<TradingPair, MarketState> {
 
 pub async fn serve() {
     let app = app(AppState {
-        markets: init_markets(),
+        markets: init_new_markets(),
     });
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -130,7 +130,25 @@ struct ApiOrderbook {
 
 impl ApiOrderbook {
     fn from_order_book(book: &order_book::OrderBook) -> Self {
-        todo!()
+        let bid = book
+            .bid_levels()
+            .map(|(p, l)| {
+                (
+                    Decimal::from_u64(p.inner()).unwrap(),
+                    Decimal::from_u64(l.total_volume().inner()).unwrap(),
+                )
+            })
+            .collect();
+        let ask = book
+            .ask_levels()
+            .map(|(p, l)| {
+                (
+                    Decimal::from_u64(p.inner()).unwrap(),
+                    Decimal::from_u64(l.total_volume().inner()).unwrap(),
+                )
+            })
+            .collect();
+        Self { bid, ask }
     }
 }
 
@@ -150,13 +168,45 @@ mod tests {
     use axum_test::TestServer;
     use Currency::*;
 
+    fn populate_order_book(order_tx: &Sender<order_book::Order>) {
+        use order_book::{Order, OrderType};
+        let order1 = Order {
+            id: 1.into(),
+            typ: OrderType::LimitBuy {
+                price: 99.into(),
+                volume: 10.into(),
+            },
+        };
+        let order2 = Order {
+            id: 2.into(),
+            typ: OrderType::LimitSell {
+                price: 101.into(),
+                volume: 10.into(),
+            },
+        };
+        order_tx.send(order1).unwrap();
+        order_tx.send(order2).unwrap();
+    }
+
     #[tokio::test]
     async fn test_get_markets() {
         let app = app(AppState {
-            markets: init_markets(),
+            markets: init_new_markets(),
         });
         let server = TestServer::new(app).unwrap();
         let pairs: Vec<TradingPair> = server.get("/markets").await.json();
         assert_eq!(pairs, vec![TradingPair::new(USD, GBP)]);
+    }
+
+    #[tokio::test]
+    async fn test_get_market_orderbook() {
+        let markets = init_new_markets();
+        let market = markets.get(&TradingPair::new(USD, GBP)).unwrap();
+        populate_order_book(&market.order_tx);
+        let app = app(AppState { markets });
+        let server = TestServer::new(app).unwrap();
+        let book: ApiOrderbook = server.get("/market/USD_GBP/orderbook").await.json();
+        assert_eq!(book.bid.len(), 1);
+        assert_eq!(book.ask.len(), 1);
     }
 }
