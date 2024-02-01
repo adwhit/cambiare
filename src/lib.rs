@@ -11,6 +11,11 @@ mod order_book;
 pub mod server;
 
 mod newtypes {
+    use rust_decimal::Decimal;
+
+    // This macro wraps a u64 in a newtype. Generally
+    // we try to use u64 for 'quantities', and just keep
+    // track of where the decimal point 'would be'
     macro_rules! newtype {
         ($newtype: ident) => {
             #[derive(
@@ -57,6 +62,16 @@ mod newtypes {
     newtype!(UserId);
     newtype!(OrderId);
     newtype!(Balance);
+
+    impl TryFrom<rust_decimal::Decimal> for Price {
+        type Error = ();
+
+        fn try_from(mut value: rust_decimal::Decimal) -> Result<Self, Self::Error> {
+            value *= Decimal::from(1_000);
+            let it: u64 = value.try_into()?;
+            todo!()
+        }
+    }
 }
 
 pub use newtypes::{Balance, OrderId, Price, UserId, Volume};

@@ -1,21 +1,24 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
-use crate::order_book;
+use crate::{order_book, Price, Volume};
 use axum::{
     extract::{Path, State},
-    routing::get,
+    http::StatusCode,
+    routing::{get, post},
     Json, Router,
 };
 use crossbeam_channel::{Receiver, Sender};
 use rust_decimal::{prelude::FromPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
 
-use crate::{Price, Volume};
-
 fn app(state: AppState) -> Router {
     Router::new()
         .route("/markets", get(get_markets))
         .route("/market/:symbol/orderbook", get(get_market_orderbook))
+        .route("/market/:symbol/order", post(place_order))
         .with_state(Arc::new(state))
 }
 
@@ -93,9 +96,43 @@ struct MarketSnapshot {
 
 struct MarketState {
     volume_24h: f64,
-    latest_snapshot: MarketSnapshot,
+    // TODO - better to have a RWLock?
+    latest_snapshot: Mutex<MarketSnapshot>,
     order_tx: Sender<order_book::Order>,
     snapshot_rx: Receiver<order_book::OrderBook>,
+}
+
+impl MarketState {
+    fn update_snapshot(&self) {
+        self.order_tx
+            .send(order_book::Order {
+                id: 0xbeef.into(),
+                typ: order_book::OrderType::SendSnapshot,
+            })
+            .unwrap();
+        let snapshot = self.snapshot_rx.recv().unwrap();
+        *self.latest_snapshot.lock().unwrap() = MarketSnapshot { book: snapshot };
+    }
+
+    fn latest_snapshot(&self) -> ApiOrderbook {
+        let guard = self.latest_snapshot.lock().unwrap();
+        ApiOrderbook::from_order_book(&guard.book)
+    }
+
+    fn place_order(&self, order_type: ApiOrderType) -> Result<(), ()> {
+        use order_book::OrderType as O;
+        use ApiOrderType as A;
+        let order = match order_type {
+            A::LimitBuy { price, volume } => O::LimitBuy {
+                price: Price::from(price),
+                volume: Volume::from(volume),
+            },
+            A::LimitSell { price, volume } => todo!(),
+            A::MarketBuy { volume } => todo!(),
+            A::MarketSell { volume } => todo!(),
+        };
+        todo!()
+    }
 }
 
 fn start_market_in_thread() -> MarketState {
@@ -109,16 +146,12 @@ fn start_market_in_thread() -> MarketState {
 
     MarketState {
         volume_24h: 0.0,
-        latest_snapshot: MarketSnapshot {
+        latest_snapshot: Mutex::new(MarketSnapshot {
             book: order_book::OrderBook::default(),
-        },
+        }),
         order_tx,
         snapshot_rx,
     }
-}
-
-async fn get_markets(state: State<Arc<AppState>>) -> Json<Vec<TradingPair>> {
-    Json(state.markets.keys().copied().collect())
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -152,14 +185,45 @@ impl ApiOrderbook {
     }
 }
 
+async fn get_markets(state: State<Arc<AppState>>) -> Json<Vec<TradingPair>> {
+    Json(state.markets.keys().copied().collect())
+}
+
 async fn get_market_orderbook(
     state: State<Arc<AppState>>,
     path: Path<String>,
 ) -> Json<ApiOrderbook> {
     let pair: TradingPair = path.as_str().parse().unwrap();
     let market = state.markets.get(&pair).unwrap();
-    let book = ApiOrderbook::from_order_book(&market.latest_snapshot.book);
+    // TODO probably don't need to update market every time
+    market.update_snapshot();
+    let book = market.latest_snapshot();
     Json(book)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum ApiOrderType {
+    LimitBuy { price: Decimal, volume: Decimal },
+    LimitSell { price: Decimal, volume: Decimal },
+    MarketBuy { volume: Decimal },
+    MarketSell { volume: Decimal },
+}
+
+async fn place_order(
+    state: State<Arc<AppState>>,
+    path: Path<String>,
+    Json(order_type): Json<ApiOrderType>,
+) -> StatusCode {
+    let Ok(pair) = path.as_str().parse::<TradingPair>() else {
+        return StatusCode::NOT_FOUND;
+    };
+    let Some(market) = state.markets.get(&pair) else {
+        return StatusCode::NOT_FOUND;
+    };
+    // TODO probably don't need to update market every time
+    market.place_order(order_type).unwrap();
+    StatusCode::OK
 }
 
 #[cfg(test)]

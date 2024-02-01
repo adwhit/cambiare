@@ -111,6 +111,7 @@ impl std::fmt::Debug for Match {
     }
 }
 
+#[derive(Clone)]
 pub struct OrderBook {
     best_ask: Price,
     best_bid: Price,
@@ -615,6 +616,9 @@ pub enum OrderType {
         price: Price,
         order_id: OrderId,
     },
+    /// Take a copy of the order book and send back
+    /// along the snapshot channel
+    SendSnapshot,
 }
 
 pub struct Order {
@@ -629,7 +633,8 @@ pub fn run_orderbook_event_loop(
 ) {
     let mut book = OrderBook::new();
     let mut matches_buffer = Vec::with_capacity(1000);
-    for order in order_rx {
+    loop {
+        let order = order_rx.recv().unwrap();
         match order.typ {
             OrderType::MarketBuy {
                 target_base_qty,
@@ -666,6 +671,7 @@ pub fn run_orderbook_event_loop(
                 };
                 continue;
             }
+            OrderType::SendSnapshot => snapshot_tx.send(book.clone()).unwrap(),
         }
         for &fill in matches_buffer.iter() {
             match_tx.send(fill).expect("tx_fill send failed");
