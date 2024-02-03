@@ -1,9 +1,9 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
 
-use crate::{order_book, Price, Volume};
+use crate::{order_book, OrderId, Price, UserId, Volume};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -14,33 +14,16 @@ use crossbeam_channel::{Receiver, Sender};
 use rust_decimal::{prelude::FromPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
 
-fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/markets", get(get_markets))
-        .route("/market/:symbol/orderbook", get(get_market_orderbook))
-        .route("/market/:symbol/order", post(place_order))
-        .with_state(Arc::new(state))
-}
-
-fn init_new_markets() -> BTreeMap<TradingPair, MarketState> {
-    use Currency::*;
-    [TradingPair::new(USD, GBP)]
-        .into_iter()
-        .map(|t| (t, start_market_in_thread()))
-        .collect()
+fn start_new_markets(
+    symbols: impl Iterator<Item = TradingPair>,
+) -> BTreeMap<TradingPair, MarketState> {
+    symbols.map(|t| (t, start_market_in_thread())).collect()
 }
 
 pub async fn serve() {
-    let app = app(AppState {
-        markets: init_new_markets(),
-    });
-
+    let app = app(AppState::new());
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
-}
-
-struct AppState {
-    markets: BTreeMap<TradingPair, MarketState>,
 }
 
 #[derive(
@@ -94,6 +77,16 @@ struct MarketSnapshot {
     book: order_book::OrderBook,
 }
 
+struct UserState {
+    open_orders: Vec<OrderId>,
+    balances: HashMap<Currency, Volume>,
+}
+
+#[derive(Default)]
+struct UserStates {
+    states: HashMap<UserId, UserState>,
+}
+
 struct MarketState {
     volume_24h: f64,
     // TODO - better to have a RWLock?
@@ -119,19 +112,29 @@ impl MarketState {
         ApiOrderbook::from_order_book(&guard.book)
     }
 
-    fn place_order(&self, order_type: ApiOrderType) -> Result<(), ()> {
+    fn place_order(&self, order_type: ApiOrderType) -> Result<OrderId, ()> {
         use order_book::OrderType as O;
         use ApiOrderType as A;
-        let order = match order_type {
+        let order_typ = match order_type {
             A::LimitBuy { price, volume } => O::LimitBuy {
-                price: Price::from(price),
-                volume: Volume::from(volume),
+                price: Price::try_from(price).unwrap(),
+                volume: Volume::try_from(volume).unwrap(),
             },
             A::LimitSell { price, volume } => todo!(),
             A::MarketBuy { volume } => todo!(),
-            A::MarketSell { volume } => todo!(),
+            A::MarketSell { volume } => O::MarketSell {
+                base_qty: volume.try_into().unwrap(),
+            },
         };
-        todo!()
+        // TODO lock user balance and get order_id
+        let order_id = 123.into();
+
+        let order = order_book::Order {
+            id: order_id,
+            typ: order_typ,
+        };
+        self.order_tx.send(order).unwrap();
+        Ok(order_id)
     }
 }
 
@@ -185,6 +188,28 @@ impl ApiOrderbook {
     }
 }
 
+struct AppState {
+    users: UserStates,
+    markets: BTreeMap<TradingPair, MarketState>,
+}
+
+impl AppState {
+    fn new() -> Self {
+        Self {
+            users: UserStates::default(),
+            markets: Default::default(),
+        }
+    }
+}
+
+fn app(state: AppState) -> Router {
+    Router::new()
+        .route("/markets", get(get_markets))
+        .route("/market/:symbol/orderbook", get(get_market_orderbook))
+        .route("/market/:symbol/order", post(place_order))
+        .with_state(Arc::new(state))
+}
+
 async fn get_markets(state: State<Arc<AppState>>) -> Json<Vec<TradingPair>> {
     Json(state.markets.keys().copied().collect())
 }
@@ -192,13 +217,17 @@ async fn get_markets(state: State<Arc<AppState>>) -> Json<Vec<TradingPair>> {
 async fn get_market_orderbook(
     state: State<Arc<AppState>>,
     path: Path<String>,
-) -> Json<ApiOrderbook> {
-    let pair: TradingPair = path.as_str().parse().unwrap();
-    let market = state.markets.get(&pair).unwrap();
+) -> Result<Json<ApiOrderbook>, StatusCode> {
+    let Ok(pair) = path.as_str().parse::<TradingPair>() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let Some(market) = state.markets.get(&pair) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
     // TODO probably don't need to update market every time
     market.update_snapshot();
     let book = market.latest_snapshot();
-    Json(book)
+    Ok(Json(book))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -210,20 +239,27 @@ enum ApiOrderType {
     MarketSell { volume: Decimal },
 }
 
+#[serde_with::serde_as]
+#[derive(Serialize, Deserialize)]
+struct PlacedOrder {
+    #[serde_as(as = "serde_with::FromInto<u64>")]
+    // we want to be careful about directly de/serializing the various IDs
+    order_id: OrderId,
+}
+
 async fn place_order(
     state: State<Arc<AppState>>,
     path: Path<String>,
     Json(order_type): Json<ApiOrderType>,
-) -> StatusCode {
+) -> Result<Json<PlacedOrder>, StatusCode> {
     let Ok(pair) = path.as_str().parse::<TradingPair>() else {
-        return StatusCode::NOT_FOUND;
+        return Err(StatusCode::NOT_FOUND);
     };
     let Some(market) = state.markets.get(&pair) else {
-        return StatusCode::NOT_FOUND;
+        return Err(StatusCode::NOT_FOUND);
     };
-    // TODO probably don't need to update market every time
-    market.place_order(order_type).unwrap();
-    StatusCode::OK
+    let order_id = market.place_order(order_type).unwrap();
+    Ok(Json(PlacedOrder { order_id }))
 }
 
 #[cfg(test)]
@@ -252,25 +288,58 @@ mod tests {
         order_tx.send(order2).unwrap();
     }
 
+    fn server() -> TestServer {
+        let app = app(AppState::new());
+        TestServer::new(app).unwrap()
+    }
+
+    fn populated_server() -> TestServer {
+        let symbols = ["USD_GBP", "USD_EUR"]
+            .into_iter()
+            .map(|s| s.parse().unwrap());
+        let markets = start_new_markets(symbols);
+        let market = markets.get(&TradingPair::new(USD, GBP)).unwrap();
+        populate_order_book(&market.order_tx);
+        let app = app(AppState::new());
+        TestServer::new(app).unwrap()
+    }
+
     #[tokio::test]
     async fn test_get_markets() {
-        let app = app(AppState {
-            markets: init_new_markets(),
-        });
-        let server = TestServer::new(app).unwrap();
+        let server = server();
         let pairs: Vec<TradingPair> = server.get("/markets").await.json();
         assert_eq!(pairs, vec![TradingPair::new(USD, GBP)]);
     }
 
     #[tokio::test]
+    async fn test_get_missing_market_404() {
+        let server = server();
+        let code = server.get("/market/USDXYZ/orderbook").await.status_code();
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        let code = server.get("/market/USD_GBP/orderbook").await.status_code();
+        assert_eq!(code, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn test_get_market_orderbook() {
-        let markets = init_new_markets();
-        let market = markets.get(&TradingPair::new(USD, GBP)).unwrap();
-        populate_order_book(&market.order_tx);
-        let app = app(AppState { markets });
-        let server = TestServer::new(app).unwrap();
+        let server = populated_server();
         let book: ApiOrderbook = server.get("/market/USD_GBP/orderbook").await.json();
         assert_eq!(book.bid.len(), 1);
         assert_eq!(book.ask.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_place_order() {
+        let server = server();
+        let order = ApiOrderType::LimitBuy {
+            price: Decimal::from(100),
+            volume: Decimal::from(500),
+        };
+        let order: PlacedOrder = server
+            .post("market/USD_GBP/order")
+            .json(&order)
+            .await
+            .json();
+        assert_eq!(order.order_id, 1.into());
     }
 }

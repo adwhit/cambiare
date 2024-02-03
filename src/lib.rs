@@ -63,15 +63,24 @@ mod newtypes {
     newtype!(OrderId);
     newtype!(Balance);
 
-    impl TryFrom<rust_decimal::Decimal> for Price {
-        type Error = ();
+    const PRICE_SCALING_FACTOR: u32 = 1_000;
+    const VOLUME_SCALING_FACTOR: u32 = 1_000;
 
-        fn try_from(mut value: rust_decimal::Decimal) -> Result<Self, Self::Error> {
-            value *= Decimal::from(1_000);
-            let it: u64 = value.try_into()?;
-            todo!()
-        }
+    macro_rules! from_decimal {
+        ($typ: ty, $factor: expr) => {
+            impl TryFrom<rust_decimal::Decimal> for $typ {
+                type Error = ();
+
+                fn try_from(mut value: rust_decimal::Decimal) -> Result<Self, Self::Error> {
+                    value *= Decimal::from($factor);
+                    let it: u64 = value.try_into().map_err(|_| ())?;
+                    Ok(Self(it))
+                }
+            }
+        };
     }
+    from_decimal!(Price, PRICE_SCALING_FACTOR);
+    from_decimal!(Volume, VOLUME_SCALING_FACTOR);
 }
 
 pub use newtypes::{Balance, OrderId, Price, UserId, Volume};
